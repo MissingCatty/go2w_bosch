@@ -1,0 +1,94 @@
+/**:
+  ros__parameters:
+
+    # Topics
+    pointCloudTopic: "/unitree/slam_lidar/points"  # PandarXT16 点云(10Hz, 63k 点/帧, 带 ring+time 字段)
+    imuTopic: "/dog_imu_lio"                       # 机身内置 /lowstate IMU（host 桥接，非摄像头 IMU）
+    odomTopic: "odometry/imu"
+    gpsTopic: "odometry/gpsz"
+
+    # Frames
+    lidarFrame: "rslidar"
+    baselinkFrame: "base_link"
+    odometryFrame: "odom"
+    mapFrame: "map"
+
+    # GPS Settings
+    useImuHeadingInitialization: false
+    useGpsElevation: false
+    gpsCovThreshold: 2.0
+    poseCovThreshold: 25.0
+
+    # Export settings
+    savePCD: false
+    savePCDDirectory: "/root/dddmr_maps/"
+
+    # Sensor Settings (PandarXT-16: 16 线机械, 0.09° 水平分辨率, 10Hz 全周扫描)
+    sensor: velodyne
+    N_SCAN: 16                                   # 16 线
+    Horizon_SCAN: 4000                           # 每环 4000 点 (360°/0.09°)
+    downsampleRate: 1                            # 1 = 不降采样 (63k 点/帧, Jetson 可处理)
+    lidarMinRange: 1.0
+    lidarMaxRange: 100.0
+
+    # IMU Settings（机身内置 /lowstate 静止实测）
+    imuAccNoise: 3.9939570888238808e-03
+    imuGyrNoise: 1.5636343949698187e-03
+    imuAccBiasN: 6.4356659353532566e-05
+    imuGyrBiasN: 3.5640318696367613e-05
+
+    imuGravity: 9.46036                         # 5 秒静止样本均值
+    imuRPYWeight: 0.01
+    # GO2-W 室内低速建图：IMU 只提供旋转初值，平移交给 scan-to-map，避免静止漂移。
+    useImuPreintegrationInitialGuess: false
+
+    # GO2-W XT16 出厂标定：T_Dog2lidar xyz=(0.1701,0,0.0908), yaw=+90°。
+    # extRPY 是雷达在机身中的姿态(+90°)；extRot 将机身 IMU 向量转入雷达系，
+    # 必须使用其逆矩阵(-90°)。二者方向不同，不能填写同一矩阵。
+    extrinsicTrans:  [ 0.1701,  0.0,  0.0908 ]
+    extrinsicRot:    [ 0.0,  1.0,  0.0,
+                      -1.0,  0.0,  0.0,
+                       0.0,  0.0,  1.0 ]
+    extrinsicRPY: [ 0.0, -1.0,  0.0,
+                    1.0,  0.0,  0.0,
+                    0.0,  0.0,  1.0 ]
+
+    # LOAM feature threshold (16 线室内)
+    edgeThreshold: 1.0
+    surfThreshold: 0.1
+    edgeFeatureMinValidNum: 10
+    surfFeatureMinValidNum: 100
+
+    # voxel filter (indoor)
+    odometrySurfLeafSize: 0.2
+    mappingCornerLeafSize: 0.1
+    mappingSurfLeafSize: 0.2
+
+    # robot motion constraint
+    # GO2-W 是平面轮式平台：限制退化环境下不可观的高度、横滚和俯仰漂移。
+    z_tollerance: 0.5
+    rotation_tollerance: 0.5
+
+    # CPU Params
+    numberOfCores: 4
+    mappingProcessInterval: 0.15
+
+    # Surrounding map
+    surroundingkeyframeAddingDistThreshold: 1.0
+    surroundingkeyframeAddingAngleThreshold: 0.2
+    surroundingKeyframeDensity: 2.0
+    surroundingKeyframeSearchRadius: 50.0
+
+    # Loop closure (开启回环, 解决"转一圈不闭环")
+    loopClosureEnableFlag: true
+    loopClosureFrequency: 1.0
+    surroundingKeyframeSize: 50
+    historyKeyframeSearchRadius: 15.0
+    historyKeyframeSearchTimeDiff: 30.0
+    historyKeyframeSearchNum: 25
+    historyKeyframeFitnessScore: 0.3
+
+    # Visualization
+    globalMapVisualizationSearchRadius: 1000.0
+    globalMapVisualizationPoseDensity: 1.0
+    globalMapVisualizationLeafSize: 0.15

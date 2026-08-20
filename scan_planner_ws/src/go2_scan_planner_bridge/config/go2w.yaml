@@ -1,0 +1,189 @@
+scan_planner_node:
+  ros__parameters:
+    use_sim_time: false
+    # Web 界面发布经过静态栅格 A* 的 nav_msgs/Path，SCAN 负责局部重规划。
+    fsm.navi_mode: 3
+    fsm.thresh_replan: 0.8
+    fsm.thresh_no_replan: 0.15
+    # The live voxel map is 10 m wide and centered on the robot.  A 5 m
+    # horizon put the target itself on its fail-closed boundary (before even
+    # accounting for the front/rear footprint centres).  Keep enough boundary
+    # and A-star-pool margin for a real lateral detour.
+    fsm.planning_horizon: 4.0
+    fsm.emergency_time: 0.8
+    fsm.fail_safe: true
+    fsm.max_replan_fail_count: 10
+    # A blocked local plan keeps the global target, holds zero velocity and
+    # retries against the live lidar grid.  Manual cancel/completion still end it.
+    fsm.replan_retry_interval: 1.0
+    # Cross-state arrival handling: the 15 cm value above still controls
+    # trajectory replanning.  A stopped ground robot may report arrival within
+    # 30 cm so a dynamically infeasible final short spline cannot leave the UI
+    # stuck in navigation forever.
+    fsm.goal_stop_speed: 0.08
+    fsm.goal_arrival_tolerance: 0.30
+    # Refuse all planning/output when the fused live lidar grid is stale.
+    fsm.live_cloud_timeout: 0.60
+    # A route that was blocked may resume only after independent fresh fused
+    # observations repeatedly agree that the local plan is executable.
+    fsm.resume_clear_observations: 3
+    grid_map.resolution: 0.05
+    grid_map.sliding_map_size_x: 10.0
+    grid_map.sliding_map_size_y: 10.0
+    grid_map.sliding_map_size_z: 3.0
+    grid_map.local_update_range_x: 5.0
+    grid_map.local_update_range_y: 5.0
+    grid_map.local_update_range_z: 2.5
+    grid_map.map_sliding_en: true
+    grid_map.map_sliding_thresh: 0.2
+    # Go2-W standing footprint is about 0.70 m x 0.43 m.  Two circles with
+    # r=0.23 m and +/-0.12 m centres form a 0.70 m x 0.46 m capsule, retaining
+    # a small lateral safety margin without the former 0.96 m x 0.60 m body.
+    grid_map.double_cylinder_radius: 0.23
+    grid_map.double_cylinder_offset: 0.12
+    grid_map.body_height: 0.45
+    grid_map.obstacles_inflation_z_up: 0.12
+    grid_map.obstacles_inflation_z_down: 0.42
+    grid_map.frame_id: odom
+    grid_map.sliding_map_frame_id: scan_sliding_map
+    grid_map.ground_height: 0.0
+    grid_map.sensor_type: lidar
+    grid_map.cloud_is_world: false
+    grid_map.need_extrinsic: false
+    # Static map ownership stops at the Web A* global planner.  Feeding the
+    # same saved cloud into SCAN's sliding grid made old people/map noise block
+    # an otherwise clear live start. Temporary obstacle avoidance still uses
+    # the current lidar cloud (while retaining the real two-cylinder body model).
+    grid_map.use_static_map: false
+    # The processed/inflated 2-D navigation grid is a separate immutable hard
+    # boundary. It prevents a live local detour from crossing a saved wall,
+    # without mixing stale 3-D map points into the live lidar occupancy layer.
+    grid_map.use_static_navigation_grid: true
+    grid_map.p_hit: 0.85
+    grid_map.p_miss: 0.30
+    grid_map.p_min: 0.12
+    grid_map.p_max: 0.98
+    grid_map.p_occ: 0.80
+    grid_map.max_ray_length: 5.0
+    # Keep the local layer genuinely short-term. A real visible chair/person
+    # is hit again every scan; one-frame lidar artifacts and moved objects are
+    # removed after 3 s. Decay runs only while fresh clouds arrive, and points
+    # within 0.8 m stay until explicitly ray-cleared so an obstacle entering
+    # the body/lidar blind zone cannot disappear by timeout.
+    grid_map.occupancy_decay_time: 3.0
+    grid_map.occupancy_decay_interval: 0.5
+    grid_map.occupancy_decay_sensor_timeout: 0.6
+    grid_map.occupancy_decay_keep_radius: 0.8
+    # Near-body hits used to be immortal. Keep blind-zone protection long
+    # enough to stop, but eventually remove a hit that current scans never see.
+    grid_map.occupancy_decay_near_max_time: 6.0
+    grid_map.vis_height: 0.45
+    grid_map.show_occ_time: false
+
+    manager.max_vel: 0.80
+    manager.max_acc: 0.60
+    manager.max_jerk: 2.0
+    manager.control_points_distance: 0.15
+    manager.feasibility_tolerance: 0.35
+    manager.planning_horizon: 4.0
+    # Let the local planner move far enough off the centreline to pass a chair.
+    # The immutable inflated navigation grid above, rather than this soft
+    # corridor, is now the hard wall-crossing guard.
+    # A chair/person-sized live obstacle currently needs about 1.2 m of
+    # lateral deviation on the test route.  Static walls remain immutable hard
+    # constraints in GridMap, so this soft reference corridor can allow the
+    # local planner enough room to go around the obstacle without permitting
+    # wall crossing.
+    manager.reference_corridor_tolerance: 1.50
+    optimization.lambda_smooth: 1.0
+    optimization.lambda_collision: 1.5
+    optimization.lambda_feasibility: 0.2
+    # Keep a mild preference for the global centreline, but let the collision
+    # term (1.5, doubled on each failed rebound) move the spline around a live
+    # obstacle. The former value 50 overpowered every collision retry and
+    # pulled each candidate straight back into the chair.
+    optimization.lambda_fitness: 2.0
+    optimization.dist0: 0.30
+    optimization.max_vel: 0.80
+    optimization.max_acc: 0.60
+    optimization.order: 3
+
+closed_loop_controller:
+  ros__parameters:
+    use_sim_time: false
+    # GO2-W can translate on its wheels while making moderate yaw corrections.
+    # Only a large error enters turn-only mode; hysteresis and a small deadband
+    # prevent repeated foot shuffles near the threshold.
+    time_forward: 0.8
+    heading_error_threshold: 0.8
+    heading_error_release_threshold: 0.35
+    yaw_deadband: 0.08
+    kp_pos: 0.7
+    kp_yaw: 0.8
+    max_vx: 0.80
+    max_vy: 0.15
+    max_vyaw: 0.45
+    # Planner, controller and physical safety gate share the same 0.80 m/s
+    # forward ceiling. Pause reference time if real tracking still falls behind
+    # instead of expiring the local trajectory before the robot catches up.
+    max_tracking_error: 0.25
+    tracking_error_release: 0.12
+    tracking_stall_timeout: 2.5
+    finish_dist: 0.15
+    # LIO-SAM mapping odometry is about 5 Hz and occasionally has a 0.45 s
+    # inter-frame gap. Keep three-frame tolerance while the 0.30 s command
+    # watchdog in the chassis gate still stops command loss first.
+    odom_timeout: 0.75
+    # Independent last-line watchdog: even if the planner callback stalls,
+    # stale lidar immediately forces cmd_vel to zero.
+    cloud_timeout: 0.60
+    trajectory_timeout: 0.5
+
+go2_realtime_recovery:
+  ros__parameters:
+    use_sim_time: false
+    double_cylinder_radius: 0.23
+    double_cylinder_offset: 0.12
+    # Body centre is about 0.47 m above the floor. Ignore the floor itself but
+    # retain obstacle returns from roughly 8 cm above it through body height.
+    obstacle_min_below_body: 0.39
+    obstacle_max_above_body: 0.50
+    activation_clearance: 0.45
+    activation_delay: 1.0
+    cloud_timeout: 0.35
+    pose_timeout: 0.40
+    cooldown: 1.5
+    max_attempts: 3
+    strafe_speed: 0.10
+    reverse_speed: 0.10
+    rotate_speed: 0.30
+    translate_duration: 1.8
+    rotate_duration: 1.4
+
+go2_scan_lio_pose_adapter:
+  ros__parameters:
+    source_topic: /lio_sam/mapping/odometry
+    frame_id: odom
+    base_frame_id: base_link
+    sensor_frame_id: rslidar
+    base_to_lidar_x: 0.1701
+    base_to_lidar_y: 0.0
+    base_to_lidar_z: 0.0908
+    base_to_lidar_yaw: 1.57079632679
+    world_z_offset: 0.53
+    velocity_alpha: 0.35
+    max_velocity_sample: 2.0
+
+go2_static_navigation_map:
+  ros__parameters:
+    map_yaml: /root/go2_navigation_maps/map_20260811_155640_273_nav.yaml
+    inflated_map_yaml: /root/go2_navigation_maps/map_20260811_155640_273_nav_inflated.yaml
+    obstacle_pcd: /root/go2_navigation_maps/map_20260811_155640_273_nav_obstacles.pcd
+    metadata_json: /root/go2_navigation_maps/map_20260811_155640_273_nav.json
+    alignment_json: /root/go2_navigation_maps/map_20260811_155640_273_nav_alignment.json
+    frame_id: odom
+    map_to_odom_x: 0.0
+    map_to_odom_y: 0.0
+    map_to_odom_z: 0.0
+    map_to_odom_yaw: 0.0
+    publish_period: 30.0

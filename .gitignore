@@ -1,0 +1,39 @@
+# ROS/colcon outputs
+**/build/
+**/build_asan/
+**/install/
+**/install_asan/
+**/log/
+
+# Python/editor/runtime caches
+**/__pycache__/
+*.py[cod]
+*.swp
+*.tmp
+.cache/
+.vscode/
+.idea/
+
+# Robot runtime data and environment maps
+go2_slam_ws/maps/
+dddmr_navigation/dddmr_maps/
+*.bag
+*.db3
+*.mcap
+*.npz
+*.npy
+*.pcd
+core
+core.*
+
+# Vendor binaries are installed separately on the robot
+go2_slam_ws/module/
+
+# Credentials and local environment overrides
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+

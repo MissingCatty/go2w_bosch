@@ -1,0 +1,2373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GO2-W 建图与导航控制台</title>
+<style>
+  :root {
+    --bg: #eff1f2; --panel: #ffffff; --panel2: #f5f6f6; --border: #c1c7cc;
+    --fg: #2e3033; --dim: #71767c; --accent: #007bc0; --bosch-red: #ea0016;
+    --ok: #00884a; --warn: #d17900; --err: #ea0016; --camera: #171a1d;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: "Bosch Sans", Arial, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  body::before {
+    content: ""; flex: 0 0 6px; width: 100%;
+    background: linear-gradient(90deg,
+      #ea0016 0 16%, #b90276 16% 31%, #50237f 31% 46%,
+      #005691 46% 62%, #008ecf 62% 78%, #00a8b0 78% 90%, #78be20 90% 100%);
+  }
+  header {
+    display: flex; flex-direction: column; align-items: stretch;
+    min-height: 66px; padding: 0 24px; border-bottom: 1px solid var(--border);
+    background: var(--panel); box-shadow: 0 1px 3px rgba(0,0,0,.08); z-index: 2;
+  }
+  .header-main { min-height: 66px; display: flex; align-items: center; gap: 18px; }
+  header h1 { font-size: 18px; font-weight: 700; letter-spacing: 0; }
+  header .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  .logo svg { display: block; width: 138px; height: auto; }
+  .mode-nav { align-self: stretch; display: flex; gap: 0; margin-left: 20px; background: transparent; border: 0; border-radius: 0; }
+  .mode-tab { position: relative; min-width: 92px; justify-content: center; padding: 8px 20px; border: 0; border-radius: 0; color: #52575c; background: transparent; font-size: 14px; }
+  .mode-tab::after { content: ""; position: absolute; left: 14px; right: 14px; bottom: -10px; height: 4px; background: transparent; }
+  .mode-tab:hover { color: var(--bosch-red); border-color: transparent; background: #f5f6f6; }
+  .mode-tab.active { color: #1f2124; background: transparent; font-weight: 700; }
+  .mode-tab.active::after { background: var(--bosch-red); }
+  .badges { margin-left: auto; display: flex; gap: 8px; }
+  .badge {
+    padding: 6px 10px; border-radius: 2px; font-size: 12px;
+    border: 1px solid var(--border); color: var(--dim); background: var(--panel2);
+    display: flex; align-items: center; gap: 6px; white-space: nowrap;
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+  .badge.on .dot { background: var(--ok); }
+  .badge.mapping .dot { background: var(--accent); animation: pulse 1.2s infinite; }
+  .badge.offline .dot { background: var(--err); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  main { flex: 1; display: grid; grid-template-columns: 3fr 2fr; grid-template-rows: 1fr 1fr; gap: 12px; padding: 16px 20px; min-height: 0; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 2px;
+    display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  .panel .title {
+    min-height: 43px; padding: 11px 14px; font-size: 13px; color: var(--fg); font-weight: 700;
+    border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+  }
+  .panel .title .tag { color: var(--bosch-red); }
+  .panel .title .hint { margin-left: auto; font-size: 11.5px; color: var(--dim); font-weight: 400; }
+  .panel canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+  #mapCanvas { touch-action: none; cursor: grab; }
+  #mapCanvas.dragging { cursor: grabbing; }
+  .panel3d { grid-column: 1; grid-row: 1 / 3; }
+  .panel2d { grid-column: 2; grid-row: 1; }
+  .panellidar { grid-column: 2; grid-row: 2; }
+  #view3d { position: relative; flex: 1; min-height: 0; }
+  #view3d canvas { position: absolute; inset: 0; }
+  #view3d, #navView3d, #mapCanvas, #lidarCanvas, #library2dStage { background: #111519; }
+  .hidden { display: none !important; }
+
+  .nav-page { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 3fr) minmax(350px, 2fr); gap: 12px; padding: 16px 20px; }
+  .nav-map-panel { min-height: 0; }
+  #navView3d { position: relative; flex: 1; min-height: 0; }
+  #navView3d canvas { position: absolute; inset: 0; }
+  .nav-side { min-height: 0; display: grid; grid-template-rows: minmax(220px, 1.25fr) auto auto; gap: 12px; overflow-y: auto; }
+  .camera-stage { position: relative; flex: 1; min-height: 0; display: grid; place-items: center; background: var(--camera); overflow: hidden; }
+  #frontCamera { width: 100%; height: 100%; object-fit: contain; opacity: 0; transition: opacity .2s; }
+  #frontCamera.online { opacity: 1; }
+  #cameraPlaceholder { position: absolute; color: #c1c7cc; font-size: 13px; text-align: center; line-height: 1.8; }
+  .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
+  .metric { padding: 10px; border-radius: 0; background: var(--panel2); border: 0; border-left: 3px solid #dfe3e5; min-width: 0; }
+  .metric label { display: block; color: var(--dim); font-size: 11px; margin-bottom: 5px; }
+  .metric b { font-size: 14px; font-weight: 600; white-space: nowrap; }
+  .goal-box { padding: 12px; display: flex; align-items: end; flex-wrap: wrap; gap: 9px; }
+  .preview-divider { margin: 0 12px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--fg); font-size: 12px; font-weight: 700; }
+  .preview-divider span { color: var(--dim); font-weight: 400; margin-left: 8px; }
+  .preview-goal-box { padding-top: 9px; }
+  .global-controls {
+    flex: 0 0 auto; width: auto; margin: 0 -24px;
+    min-height: 43px; padding: 7px 24px; border-top: 1px solid var(--border);
+    border-left: 4px solid #8a9097; background: var(--panel2);
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px;
+  }
+  .global-controls.enabled { border-left-color: var(--bosch-red); background: #fff5f5; }
+  .teleop-switch { display: inline-flex; align-items: center; gap: 9px; color: var(--fg); font-size: 12px; font-weight: 700; cursor: pointer; }
+  .teleop-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+  .teleop-track { position: relative; width: 42px; height: 22px; border-radius: 12px; background: #8a9097; transition: background .15s; }
+  .teleop-track::after { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .teleop-switch input:checked + .teleop-track { background: var(--bosch-red); }
+  .teleop-switch input:checked + .teleop-track::after { transform: translateX(20px); }
+  .teleop-switch input:disabled + .teleop-track { opacity: .45; }
+  .teleop-keys { display: flex; flex-wrap: wrap; gap: 5px; }
+  .teleop-keys kbd { min-width: 31px; padding: 4px 6px; border: 1px solid #8a9097; border-bottom-width: 2px; background: #fff; color: var(--fg); font: 700 11px/1.2 "Bosch Sans", Arial, sans-serif; text-align: center; }
+  .teleop-keys kbd.active { color: #fff; background: var(--bosch-red); border-color: var(--bosch-red); }
+  .teleop-actions { display: flex; gap: 7px; padding-left: 14px; border-left: 1px solid var(--border); }
+  .teleop-actions button { padding: 7px 11px; }
+  .teleop-status { flex: 1; min-width: 210px; color: var(--dim); font-size: 11.5px; }
+  .field { display: flex; flex-direction: column; gap: 5px; color: var(--dim); font-size: 11px; }
+  input { width: 110px; background: #fff; color: var(--fg); border: 1px solid #8a9097; border-radius: 0; padding: 8px 10px; outline: none; }
+  input:focus { border-color: var(--accent); }
+  .route-legend { padding: 0 12px 12px; display: flex; flex-wrap: wrap; gap: 8px 15px; color: var(--dim); font-size: 11.5px; }
+  .legend-line { display: inline-block; width: 22px; height: 3px; margin-right: 6px; vertical-align: middle; border-radius: 0; }
+  .nav-footer-note { color: var(--warn); font-size: 12px; }
+  .maps-page { flex: 1; min-height: 0; display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 12px; padding: 16px 20px; }
+  .library-toolbar { padding: 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .map-list { flex: 1; min-height: 0; overflow-y: auto; }
+  .map-row { display: flex; align-items: center; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #dfe3e5; }
+  .map-row.active { background: #e5f4fb; border-left: 4px solid var(--accent); padding-left: 8px; }
+  .map-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+  .map-actions { display: flex; gap: 3px; }
+  .map-actions button { padding: 5px 7px; font-size: 11px; }
+  .map-actions button.danger { color: var(--err); }
+  .map-actions button.danger:hover { background: #fff0f1; }
+  .map-empty { padding: 24px 16px; color: var(--dim); text-align: center; font-size: 13px; }
+  .library-preview { min-width: 0; min-height: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  #libraryView3d { position: relative; flex: 1; min-height: 0; background: #111519; }
+  #libraryView3d canvas { position: absolute; inset: 0; }
+  #library2dStage { position: relative; flex: 1; min-height: 0; overflow: hidden; cursor: grab; touch-action: none; }
+  #library2dStage.dragging { cursor: grabbing; }
+  #library2dStage.erase-mode { cursor: crosshair; }
+  #library2dStage.erase-mode.dragging { cursor: grabbing; }
+  #library2dImage { position: absolute; display: none; max-width: none; max-height: none; user-select: none; pointer-events: none; transform-origin: 0 0; image-rendering: pixelated; }
+  .map-editor-toolbar { padding: 8px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .map-editor-toolbar button { padding: 6px 10px; font-size: 12px; }
+  .map-editor-note { color: var(--dim); font-size: 11px; margin-left: auto; }
+  #libraryEraseOverlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 3; pointer-events: none; overflow: visible; }
+  .library-erase-polygon { fill: rgba(17,21,25,.97); stroke: var(--bosch-red); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .library-erase-polygon.draft { fill: rgba(234,0,22,.10); stroke-dasharray: 7 4; }
+  .library-erase-label { fill: #fff; font-size: 11px; font-weight: 700; text-anchor: middle; dominant-baseline: central; }
+  .library-erase-label-bg { fill: var(--bosch-red); }
+  .preview-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #9da5ab; font-size: 13px; text-align: center; line-height: 1.8; pointer-events: none; }
+  .library-meta { padding: 8px 12px; border-top: 1px solid var(--border); color: var(--dim); font-size: 12px; }
+
+  footer {
+    min-height: 58px; padding: 10px 20px; border-top: 1px solid var(--border); background: var(--panel);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  }
+  button {
+    background: #fff; color: var(--fg); border: 1px solid #8a9097;
+    padding: 9px 18px; border-radius: 0; font-size: 14px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px; transition: all .15s;
+  }
+  button:hover { border-color: var(--bosch-red); color: var(--bosch-red); background: #fff5f5; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--bosch-red); color: #fff; border-color: var(--bosch-red); font-weight: 700; }
+  button.primary:hover { background: #c90013; border-color: #c90013; color: #fff; }
+  button.danger-action { background: var(--bosch-red); color: #fff; border-color: var(--bosch-red); font-weight: 700; }
+  button.danger-action:hover { background: #c90013; color: #fff; }
+  .status-line {
+    flex: 1; min-width: 260px; font-size: 12.5px; color: var(--dim);
+    display: flex; flex-wrap: wrap; gap: 4px 18px; line-height: 1.7;
+  }
+  .status-line b { color: var(--fg); font-weight: 500; }
+  .maps-box {
+    display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dim);
+  }
+  select {
+    background: #fff; color: var(--fg); border: 1px solid #8a9097;
+    padding: 6px 10px; border-radius: 0; font-size: 12.5px; outline: none;
+  }
+  select:focus { border-color: var(--accent); }
+  #toast {
+    position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%);
+    background: #2e3033; border-left: 4px solid var(--accent); color: #fff;
+    padding: 11px 18px; border-radius: 0; font-size: 13px; max-width: 70%;
+    box-shadow: 0 8px 24px rgba(0,0,0,.24); opacity: 0; transition: opacity .25s; z-index: 10;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { border-left-color: var(--err); color: #fff; }
+  a.dl { color: var(--accent); text-decoration: none; font-size: 12px; }
+  a.dl:hover { text-decoration: underline; }
+  @media (max-width: 900px) { .header-main { flex-wrap: wrap; padding: 10px 0; } .mode-nav { margin-left: 0; } .badges { width: 100%; margin-left: 0; overflow-x: auto; } .global-controls { gap: 8px; } .global-controls .teleop-status { flex-basis: 100%; } main { grid-template-columns: 1fr; overflow-y: auto; } .panel3d { grid-column: 1; grid-row: 1; min-height: 430px; } .panel2d { grid-column: 1; grid-row: 2; min-height: 320px; } .panellidar { grid-column: 1; grid-row: 3; min-height: 320px; } .nav-page { grid-template-columns: 1fr; overflow-y: auto; } .nav-map-panel { min-height: 500px; } .nav-side { min-height: 720px; } .maps-page { grid-template-columns: 1fr; overflow-y: auto; } .map-list { max-height: 320px; } .library-preview { grid-template-columns: 1fr; min-height: 900px; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-main">
+  <div class="logo">
+    <svg id="Ebene_1" data-name="Ebene 1" xmlns="http://www.w3.org/2000/svg" width="152" height="34" viewBox="0 0 433 97">
+  <g>
+    <g id="logotype">
+      <path id="logotype-b-47" d="M185.2,46.88a13.77,13.77,0,0,0,8.8-13c0-11.7-8.3-17.5-19.7-17.5H144.4V80h32.5c10,0,19.8-7,19.8-17.7C196.7,49.58,185.2,47,185.2,46.88ZM160,29.58h11.6a5.66,5.66,0,0,1,6,5.31q0,.34,0,.69a5.93,5.93,0,0,1-6,5.81H159.9Zm11.7,37.1H160.1V54.18h11.3c5.7,0,8.4,2.5,8.4,6.2C179.8,65,176.4,66.68,171.7,66.68Z" style="fill: #ed0007;fill-rule: evenodd"/>
+      <path id="logotype-o-47" d="M231.1,14.78c-18.4,0-29.2,14.7-29.2,33.3s10.8,33.3,29.2,33.3,29.2-14.6,29.2-33.3S249.6,14.78,231.1,14.78Zm0,51.4c-9,0-13.5-8.1-13.5-18.1s4.5-18,13.5-18,13.6,8.1,13.6,18C244.7,58.18,240.1,66.18,231.1,66.18Z" style="fill: #ed0007;fill-rule: evenodd"/>
+      <path id="logotype-s-47" d="M294.2,41.38l-2.2-.5c-5.4-1.1-9.7-2.5-9.7-6.4,0-4.2,4.1-5.9,7.7-5.9a17.86,17.86,0,0,1,13,5.9l9.9-9.8c-4.5-5.1-11.8-10-23.2-10-13.4,0-23.6,7.5-23.6,20,0,11.4,8.2,17,18.2,19.1l2.2.5c8.3,1.7,11.4,3,11.4,7,0,3.8-3.4,6.3-8.6,6.3-6.2,0-11.8-2.7-16.1-8.2l-10.1,10c5.6,6.7,12.7,11.9,26.4,11.9,11.9,0,24.6-6.8,24.6-20.7C314.3,46.08,303.3,43.28,294.2,41.38Z" style="fill: #ed0007;fill-rule: evenodd"/>
+      <path id="logotype-c-47" d="M349.7,66.18c-7,0-14.3-5.8-14.3-18.5,0-11.3,6.8-17.6,13.9-17.6,5.6,0,8.9,2.6,11.5,7.1l12.8-8.5c-6.4-9.7-14-13.8-24.5-13.8-19.2,0-29.6,14.9-29.6,32.9,0,18.9,11.5,33.7,29.4,33.7,12.6,0,18.6-4.4,25.1-13.8L361.1,59C358.5,63.18,355.7,66.18,349.7,66.18Z" style="fill: #ed0007;fill-rule: evenodd"/>
+      <polygon id="logotype-h-47" points="416.3 16.38 416.3 39.78 397 39.78 397 16.38 380.3 16.38 380.3 79.98 397 79.98 397 54.88 416.3 54.88 416.3 79.98 433 79.98 433 16.38 416.3 16.38" style="fill: #ed0007;fill-rule: evenodd"/>
+    </g>
+    <g id="symbol">
+      <path d="M48.2.18a48.2,48.2,0,1,0,48.2,48.2A48.2,48.2,0,0,0,48.2.18Zm0,91.9a43.7,43.7,0,1,1,43.7-43.7,43.71,43.71,0,0,1-43.7,43.7Z"/>
+      <path d="M68.1,18.28H64.8v16.5H31.7V18.28H28.3a36.06,36.06,0,0,0,0,60.2h3.4V62H64.8v16.5h3.3a36.05,36.05,0,0,0,0-60.2ZM27.1,72A31.59,31.59,0,0,1,24.47,27.4a32.51,32.51,0,0,1,2.63-2.62Zm37.7-14.6H31.7V39.28H64.8Zm4.5,14.5v-10h0V34.78h0v-10a31.65,31.65,0,0,1,2.39,44.71A33.68,33.68,0,0,1,69.3,71.88Z"/>
+    </g>
+  </g>
+</svg>
+  </div>
+  <div>
+    <h1 id="pageTitle">GO2-W 建图控制台</h1>
+    <div class="sub">LIO-SAM · ROS2 · 浏览器控制端</div>
+  </div>
+  <nav class="mode-nav" aria-label="功能导航">
+    <button class="mode-tab active" id="tabMapping" data-mode="mapping">建图</button>
+    <button class="mode-tab" id="tabNavigation" data-mode="navigation">导航</button>
+    <button class="mode-tab" id="tabMaps" data-mode="maps">地图管理</button>
+  </nav>
+  <div class="badges">
+    <span class="badge offline" id="bdEngine"><span class="dot"></span>引擎: 等待中</span>
+    <span class="badge offline" id="bdMap"><span class="dot"></span>地图: 等待中</span>
+    <span class="badge" id="bdConn"><span class="dot"></span>连接中…</span>
+    <span class="badge offline" id="bdMapping"><span class="dot"></span>建图: 未就绪</span>
+  </div>
+  </div>
+  <div class="global-controls" id="teleopBox" aria-label="全局机器狗控制">
+    <label class="teleop-switch" title="全局功能；开启时会取消当前路径导航并启用真实底盘">
+      <input id="teleopToggle" type="checkbox" disabled>
+      <span class="teleop-track" aria-hidden="true"></span>
+      <span>键盘控制</span>
+    </label>
+    <div class="teleop-keys" aria-label="键盘控制按键">
+      <kbd data-teleop-key="q">Q 左转</kbd><kbd data-teleop-key="w">W 前进</kbd><kbd data-teleop-key="e">E 右转</kbd>
+      <kbd data-teleop-key="a">A 左移</kbd><kbd data-teleop-key="s">S 后退</kbd><kbd data-teleop-key="d">D 右移</kbd>
+    </div>
+    <div class="teleop-actions" aria-label="机器狗姿态动作">
+      <button id="btnStandDown" disabled>卧倒</button>
+      <button id="btnRecoveryStand" disabled>恢复可移动姿态</button>
+    </div>
+    <span class="teleop-status" id="teleopStatus">正在连接底盘安全门…</span>
+  </div>
+</header>
+
+<main id="mappingPage">
+  <div class="panel panel3d">
+    <div class="title"><span class="tag">◈</span> 3D 建图视图 <span class="hint" id="st3D">左键旋转 · 中键平移 · 滚轮缩放 · 蓝色箭头=机器人</span></div>
+    <div id="view3d"></div>
+  </div>
+  <div class="panel panel2d">
+    <div class="title"><span class="tag">◈</span> 2D 俯视图 <span class="hint" id="mapHint">滚轮/双指缩放 · 拖动平移 · 双击复位</span></div>
+    <canvas id="mapCanvas"></canvas>
+  </div>
+  <div class="panel panellidar">
+    <div class="title"><span class="tag">◎</span> 雷达画面 <span class="hint">实时点云 · 前向朝上(随狗转向)</span></div>
+    <canvas id="lidarCanvas"></canvas>
+  </div>
+</main>
+
+<footer id="mappingFooter">
+  <button id="btnMappingStart" class="primary">开始建图</button>
+  <button id="btnSave" disabled>保存地图</button>
+  <button id="btnMappingStop" disabled>停止建图</button>
+  <div class="status-line">
+    <span>位姿: <b id="stPose">--</b></span>
+    <span>雷达: <b id="stLidar">--</b></span>
+    <span>地图: <b id="stMap">--</b></span>
+    <span id="stOpLine" style="display:none">操作: <b id="stOp">--</b></span>
+  </div>
+</footer>
+
+<section id="mapsPage" class="maps-page hidden">
+  <div class="panel">
+    <div class="title"><span class="tag">◆</span> 地图管理 <span class="hint" id="mapCount">0 张</span></div>
+    <div class="library-toolbar">
+      <input id="mapUploadInput" type="file" accept=".npz" class="hidden">
+      <button class="primary" id="btnAddMap">添加地图</button>
+      <button id="btnRefreshMaps">刷新</button>
+    </div>
+    <div class="map-list" id="mapLibraryList"><div class="map-empty">暂无地图</div></div>
+  </div>
+  <div class="library-preview">
+    <div class="panel">
+      <div class="title"><span class="tag">◈</span> 3D 预览 <span class="hint" id="library3dHint">请先打开地图</span></div>
+      <div id="libraryView3d"><div class="preview-empty" id="library3dEmpty">从左侧选择地图并打开<br>左键旋转 · 中键平移 · 滚轮缩放</div></div>
+      <div class="library-meta" id="libraryMeta">未打开地图</div>
+    </div>
+    <div class="panel">
+      <div class="title"><span class="tag">◈</span> 2D 俯视预览 <span class="hint" id="library2dHint">滚轮缩放 · 中键拖动平移 · 双击复位</span></div>
+      <div class="map-editor-toolbar">
+        <button id="btnEraseMode" disabled>手绘擦除</button>
+        <button id="btnEraseUndo" disabled>撤销上一个</button>
+        <button id="btnEraseCancel" disabled>清空区域</button>
+        <button class="primary" id="btnEraseSave" disabled>统一另存</button>
+        <span class="map-editor-note" id="libraryEraseNote">沿轮廓手绘；仅删地面上方 0.08–2.20 m</span>
+      </div>
+      <div id="library2dStage">
+        <img id="library2dImage" alt="2D 地图预览">
+        <svg id="libraryEraseOverlay" aria-hidden="true"></svg>
+        <div class="preview-empty" id="library2dEmpty">打开地图后显示 2D 预览</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="navigationPage" class="nav-page hidden">
+  <div class="panel nav-map-panel">
+    <div class="title"><span class="tag">◈</span> 3D 静态导航地图
+      <span class="hint" id="navMapHint">左键旋转 · 中键平移 · 滚轮缩放 · 双击地面选择目标</span>
+    </div>
+    <div id="navView3d"></div>
+  </div>
+  <div class="nav-side">
+    <div class="panel">
+      <div class="title"><span class="tag">◉</span> 前置摄像头
+        <span class="hint" id="cameraStatus">发送真实导航后按需拉流</span>
+      </div>
+      <div class="camera-stage">
+        <div id="cameraPlaceholder">离线预演不启用视频<br>发送真实导航后自动开启</div>
+        <img id="frontCamera" alt="机器狗前置摄像头实时画面">
+      </div>
+    </div>
+    <div class="panel">
+      <div class="title"><span class="tag">◆</span> 机器狗状态 <span class="hint">机身 LowState IMU + 导航里程计</span></div>
+      <div class="status-grid">
+        <div class="metric"><label>平移速度</label><b id="navSpeed">-- m/s</b></div>
+        <div class="metric"><label>偏航角速度</label><b id="navYawRate">-- °/s</b></div>
+        <div class="metric"><label>电量</label><b id="navSoc">-- %</b></div>
+        <div class="metric"><label>位置 x / y / z</label><b id="navPosition">--</b></div>
+        <div class="metric"><label>姿态 roll / pitch / yaw</label><b id="navAttitude">--</b></div>
+        <div class="metric"><label>电压 / 电流 / IMU温度</label><b id="navPower">--</b></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="title"><span class="tag">⌖</span> 导航目标 <span class="hint">坐标系 map / 米</span></div>
+      <div class="preview-divider">重启后自动定位<span>粗选当前区域，系统用实时雷达与 3D 地图自动精配准；质量不达标不会启用底盘</span></div>
+      <div class="goal-box preview-goal-box">
+        <label class="field">粗选 X<input id="alignmentX" type="number" step="0.1" placeholder="大约即可"></label>
+        <label class="field">粗选 Y<input id="alignmentY" type="number" step="0.1" placeholder="大约即可"></label>
+        <label class="field">大致朝向（可留空）<input id="alignmentYaw" type="number" step="1" placeholder="0°=+X，90°=+Y"></label>
+        <button id="btnPickAlignment">地图粗选位置</button>
+        <button class="primary" id="btnSaveAlignment">采集点云并自动精配准</button>
+      </div>
+      <div class="route-legend"><span id="alignmentQuality">未进行本次开机自动定位</span></div>
+      <div class="goal-box">
+        <label class="field">目标 X<input id="goalX" type="number" step="0.1" placeholder="0.0"></label>
+        <label class="field">目标 Y<input id="goalY" type="number" step="0.1" placeholder="0.0"></label>
+        <button class="primary" id="btnPlan">规划并发送</button>
+        <button id="btnCancelNavigation" disabled>取消导航</button>
+        <button id="btnChassisEnable">启用真实底盘</button>
+      </div>
+      <div class="preview-divider">离线路径预演<span>沿用上方目标 · 不启动 SCAN / 摄像头 / ROS 路径</span></div>
+      <div class="goal-box preview-goal-box">
+        <label class="field">假起点 X<input id="previewStartX" type="number" step="0.1" placeholder="0.0"></label>
+        <label class="field">假起点 Y<input id="previewStartY" type="number" step="0.1" placeholder="0.0"></label>
+        <button id="btnPickPreviewStart">地图选起点</button>
+        <button class="primary" id="btnPreviewPlan">只看路径</button>
+        <button id="btnClearPreview" disabled>清除预演</button>
+      </div>
+      <div class="route-legend">
+        <span><i class="legend-line" style="background:#007bc0"></i>已走实际轨迹</span>
+        <span><i class="legend-line" style="background:#d17900"></i>剩余全局路径</span>
+        <span><i class="legend-line" style="background:#9e2896"></i>当前局部路径</span>
+        <span><i class="legend-line" style="background:#00a38b"></i>离线预演路径</span>
+        <span id="routeStatus">等待设置目标点</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer id="navigationFooter" class="hidden">
+  <div class="nav-footer-note" id="chassisSafetyNote">真实底盘默认锁定；启用后受速度限制、命令超时、里程计/IMU 看门狗保护。</div>
+  <div class="status-line">
+    <span>导航位姿: <b id="navPoseHealth">--</b></span>
+    <span>地图标定: <b id="navAlignmentHealth">未标定</b></span>
+    <span>规划器: <b id="navPlannerHealth">--</b></span>
+    <span>局部路径: <b id="navLocalHealth">--</b></span>
+    <span>摄像头: <b id="navCameraHealth">--</b></span>
+    <span>真实底盘: <b id="navChassisHealth">锁定</b></span>
+  </div>
+</footer>
+
+<div id="toast"></div>
+
+<script src="/static/three.min.js"></script>
+<script src="/static/OrbitControls.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const mapCanvas = $('mapCanvas'), lidarCanvas = $('lidarCanvas');
+const mctx = mapCanvas.getContext('2d'), lctx = lidarCanvas.getContext('2d');
+
+let frame = null;
+let navFrame = null;
+// The alignment HTTP request also waits for SCAN to restart.  Track the
+// earlier WebSocket alignment transition separately so the UI stops saying
+// "registering" as soon as the registration result is actually committed.
+let alignmentRequestUi = null;
+let activeMode = 'mapping';
+let mappingActive = false;
+let chassisEnabled = false;
+let teleopEnabled = false;
+let trail = [];                 // 位姿轨迹（地图画布）
+let ws = null, wsTimer = null;
+let toastTimer = null;
+const teleopClientId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+  value => value.toString(16).padStart(2, '0')).join('');
+const teleopKeys = new Set();
+const teleopKeyNames = new Set(['w', 's', 'a', 'd', 'q', 'e']);
+let teleopTimer = null;
+let teleopDisablePending = false;
+let postureRequestPending = false;
+const mapView = { zoom: 1, panX: 0, panY: 0 };
+const MAP_ZOOM_MIN = 0.25, MAP_ZOOM_MAX = 20;
+
+// ---------- 画布尺寸 ----------
+function fitCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  cv.width = Math.max(2, Math.floor(r.width * dpr));
+  cv.height = Math.max(2, Math.floor(r.height * dpr));
+}
+window.addEventListener('resize', () => {
+  const oldW = mapCanvas.width, oldH = mapCanvas.height;
+  fitCanvas(mapCanvas);
+  fitCanvas(lidarCanvas);
+  if (oldW > 0 && oldH > 0) {
+    mapView.panX *= mapCanvas.width / oldW;
+    mapView.panY *= mapCanvas.height / oldH;
+  }
+  drawMap();
+  resize3D();
+  resizeNav3D();
+  resizeLibrary3D();
+  renderLibrary2D();
+});
+
+// ============================================================
+//  3D 视图（Three.js 粒子）
+// ============================================================
+const view3dEl = $('view3d');
+let scene, camera, renderer, controls;
+let mapPts = null;                     // 当前 3D 点（扁平数组）
+let robotGroup = null, trailLine3D = null;
+let lidarLivePts = [], lidarLiveMesh = null;   // 实时点云（白色参照）
+
+function init3D() {
+  const w = view3dEl.clientWidth, h = view3dEl.clientHeight;
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111519);
+
+  camera = new THREE.PerspectiveCamera(60, w / Math.max(1, h), 0.05, 200);
+  camera.position.set(8, 8, 8);
+  camera.lookAt(0, 0, 0);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(w, h);
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  view3dEl.appendChild(renderer.domElement);
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 0, 0);
+
+  // 地面参考网格 + 坐标轴
+  const grid = new THREE.GridHelper(20, 20, 0x52606a, 0x293138);
+  grid.position.y = -0.1;
+  scene.add(grid);
+  const axes = new THREE.AxesHelper(2);
+  scene.add(axes);
+
+  // 高度标尺：网格角落 (-0.5,-0.5) 处 0~2.5m 刻度柱，验证 z 方向/高度感
+  {
+    const rulerMat = new THREE.LineBasicMaterial({ color: 0x007bc0, transparent: true, opacity: 0.9 });
+    for (let hgt = 0; hgt <= 2.5; hgt += 0.5) {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(-0.5, -0.05, -0.5), new THREE.Vector3(-0.5, hgt, -0.5),
+        new THREE.Vector3(-0.5, hgt, -0.5), new THREE.Vector3(-0.5, hgt, -0.25),
+      ]);
+      scene.add(new THREE.Line(g, rulerMat));
+    }
+  }
+
+  // 实时雷达点云（白色）——真值参照，与雷达画面同坐标系，跟随机器人位姿
+  lidarLiveMesh = new THREE.Points(
+    new THREE.BufferGeometry(),
+    new THREE.PointsMaterial({
+      size: 0.06, color: 0xffffff, sizeAttenuation: true,
+      transparent: true, opacity: 0.85,
+    })
+  );
+  scene.add(lidarLiveMesh);
+
+  // 机器人标记：蓝色箭头（y 轴朝上 = 高度）
+  robotGroup = new THREE.Group();
+  const cone = new THREE.Mesh(
+    new THREE.ConeGeometry(0.14, 0.5, 12),
+    new THREE.MeshBasicMaterial({ color: 0xea0016 })
+  );
+  cone.rotation.x = Math.PI / 2;   // 尖朝 x（前向）
+  robotGroup.add(cone);
+  scene.add(robotGroup);
+
+  // 位姿轨迹线
+  trailLine3D = new THREE.Line(
+    new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ color: 0x007bc0, transparent: true, opacity: 0.8 })
+  );
+  scene.add(trailLine3D);
+
+  animate();
+}
+
+// ROS 是 x前/y左/z上；Three.js 是 x右/y上/z朝观察者。
+// 使用 -ROS y 才保持右手系，避免俯视图出现南北镜像。
+const ros2three = (x, y, z) => new THREE.Vector3(x, z, -y);
+
+function updateParticles3D() {
+  const pts = mapPts;
+  const nMap = pts ? pts.length / 3 : 0;
+  if (nMap === 0) return;
+
+  const pos = new Float32Array(nMap * 3);
+  const col = new Float32Array(nMap * 3);
+  let k = 0;
+
+  // ROS(map x前/y左/z上) -> Three(y 上)：存 (x, z, -y)。
+  const put = (x, y, z, r, g, b) => {
+    pos[k * 3] = x; pos[k * 3 + 1] = z; pos[k * 3 + 2] = -y;
+    col[k * 3] = r; col[k * 3 + 1] = g; col[k * 3 + 2] = b;
+    k++;
+  };
+
+  // 墙面层：按高度彩虹渐变（低=蓝, 中=青/绿, 高=黄/红），区分度远高于单一色系
+  const tmpC = new THREE.Color();
+  for (let i = 0; i < nMap; i++) {
+    const x = pts[i * 3], y = pts[i * 3 + 1], z = pts[i * 3 + 2];
+    const t = Math.min(1, Math.max(0, (z + 0.6) / 2.6));   // -0.6m→0, 2.0m→1
+    tmpC.setHSL(0.62 - 0.62 * t, 0.85, 0.55);              // 蓝→青→绿→黄→红
+    put(x, y, z, tmpC.r, tmpC.g, tmpC.b);
+  }
+  // 合并成一个 Points 对象
+  let mesh = scene.getObjectByName('pointcloud');
+  if (!mesh) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    mesh = new THREE.Points(geo, new THREE.PointsMaterial({
+      size: 0.07, vertexColors: true, sizeAttenuation: true,
+    }));
+    mesh.name = 'pointcloud';
+    scene.add(mesh);
+  } else {
+    mesh.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    mesh.geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  }
+}
+
+function updateRobot3D() {
+  if (!frame || !frame.pose || !robotGroup) return;
+  const p = frame.pose;
+  const v = ros2three(p.x, p.y, 0.25);   // 雷达装高 ~0.45，箭头放在 ~0.25
+  robotGroup.position.copy(v);
+  robotGroup.rotation.y = p.yaw;         // 右手映射后 ROS yaw 与 Three 绕 y 同号
+}
+
+function updateLidarLive3D() {
+  if (!lidarLiveMesh || !lidarLivePts.length || !frame) return;
+  const p = frame.pose || { x: 0, y: 0, yaw: 0 };
+  const c = Math.cos(p.yaw), s = Math.sin(p.yaw);
+  const n = lidarLivePts.length;
+  const arr = new Float32Array(n);
+  for (let i = 0; i < n; i += 3) {
+    const dx = lidarLivePts[i], dy = lidarLivePts[i + 1], dz = lidarLivePts[i + 2];
+    // 狗系 -> map 系：按机器人位姿平移旋转；再 (x,z,-y) 转 Three
+    arr[i] = p.x + c * dx - s * dy;
+    arr[i + 1] = dz;
+    arr[i + 2] = -(p.y + s * dx + c * dy);
+  }
+  lidarLiveMesh.geometry.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+}
+
+function updateTrail3D() {
+  if (!trailLine3D || trail.length < 2) return;
+  const arr = new Float32Array(trail.length * 3);
+  trail.forEach((p, i) => {
+    const v = ros2three(p.x, p.y, 0.05);
+    arr[i * 3] = v.x; arr[i * 3 + 1] = v.y; arr[i * 3 + 2] = v.z;
+  });
+  trailLine3D.geometry.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+}
+
+function resize3D() {
+  if (!renderer) return;
+  const w = view3dEl.clientWidth, h = view3dEl.clientHeight;
+  if (w < 2 || h < 2) return;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (activeMode === 'mapping') {
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  if (activeMode === 'navigation' && navRenderer) {
+    navControls.update();
+    navRenderer.render(navScene, navCamera);
+  }
+  if (activeMode === 'maps' && libraryRenderer) {
+    libraryControls.update();
+    libraryRenderer.render(libraryScene, libraryCamera);
+  }
+}
+
+// ---------- 地图画面（2D，north-up） ----------
+let mapImg = null;      // 缓存的已解码地图图片
+let mapSrc = '';        // 当前已解码的 dataURL
+
+function getMapTransform(zoom = mapView.zoom) {
+  if (!mapImg) return null;
+  const baseScale = Math.min(mapCanvas.width / mapImg.width, mapCanvas.height / mapImg.height);
+  const scale = baseScale * zoom;
+  const dw = mapImg.width * scale, dh = mapImg.height * scale;
+  return {
+    scale, dw, dh,
+    dx: (mapCanvas.width - dw) / 2 + mapView.panX,
+    dy: (mapCanvas.height - dh) / 2 + mapView.panY,
+  };
+}
+
+function updateMapHint() {
+  $('mapHint').textContent =
+    `${Math.round(mapView.zoom * 100)}% · 滚轮/双指缩放 · 拖动平移 · 双击复位`;
+}
+
+// 以鼠标/双指中点为锚点缩放，锚点下的地图坐标保持不动。
+function setMapZoom(nextZoom, anchorX, anchorY) {
+  if (!mapImg) return;
+  const oldT = getMapTransform();
+  if (!oldT) return;
+  const x = Number.isFinite(anchorX) ? anchorX : mapCanvas.width / 2;
+  const y = Number.isFinite(anchorY) ? anchorY : mapCanvas.height / 2;
+  const srcX = (x - oldT.dx) / oldT.scale;
+  const srcY = (y - oldT.dy) / oldT.scale;
+
+  mapView.zoom = Math.max(MAP_ZOOM_MIN, Math.min(MAP_ZOOM_MAX, nextZoom));
+  const baseScale = Math.min(mapCanvas.width / mapImg.width, mapCanvas.height / mapImg.height);
+  const scale = baseScale * mapView.zoom;
+  const centeredX = (mapCanvas.width - mapImg.width * scale) / 2;
+  const centeredY = (mapCanvas.height - mapImg.height * scale) / 2;
+  mapView.panX = x - srcX * scale - centeredX;
+  mapView.panY = y - srcY * scale - centeredY;
+  updateMapHint();
+  renderMapFrame();
+}
+
+function resetMapView() {
+  mapView.zoom = 1;
+  mapView.panX = 0;
+  mapView.panY = 0;
+  updateMapHint();
+  drawMap();
+}
+
+function canvasPoint(ev) {
+  const r = mapCanvas.getBoundingClientRect();
+  return {
+    x: (ev.clientX - r.left) * mapCanvas.width / Math.max(1, r.width),
+    y: (ev.clientY - r.top) * mapCanvas.height / Math.max(1, r.height),
+  };
+}
+
+mapCanvas.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const p = canvasPoint(ev);
+  let delta = ev.deltaY;
+  if (ev.deltaMode === 1) delta *= 16;
+  else if (ev.deltaMode === 2) delta *= 200;
+  const exponent = Math.max(-0.5, Math.min(0.5, -delta * 0.0015));
+  setMapZoom(mapView.zoom * Math.exp(exponent), p.x, p.y);
+}, { passive: false });
+
+const mapPointers = new Map();
+let mapPinch = null;
+
+function currentPinch() {
+  const pts = Array.from(mapPointers.values());
+  if (pts.length < 2) return null;
+  const a = pts[0], b = pts[1];
+  return {
+    distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+    mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+  };
+}
+
+mapCanvas.addEventListener('pointerdown', ev => {
+  if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  ev.preventDefault();
+  mapCanvas.setPointerCapture(ev.pointerId);
+  const p = canvasPoint(ev);
+  mapPointers.set(ev.pointerId, p);
+  mapPinch = currentPinch();
+  mapCanvas.classList.add('dragging');
+});
+
+mapCanvas.addEventListener('pointermove', ev => {
+  if (!mapPointers.has(ev.pointerId)) return;
+  ev.preventDefault();
+  const oldPinch = mapPinch;
+  const p = canvasPoint(ev);
+  const previous = mapPointers.get(ev.pointerId);
+  mapPointers.set(ev.pointerId, p);
+
+  if (mapPointers.size >= 2) {
+    const nextPinch = currentPinch();
+    if (oldPinch && nextPinch) {
+      mapView.panX += nextPinch.mid.x - oldPinch.mid.x;
+      mapView.panY += nextPinch.mid.y - oldPinch.mid.y;
+      setMapZoom(
+        mapView.zoom * nextPinch.distance / oldPinch.distance,
+        nextPinch.mid.x, nextPinch.mid.y
+      );
+    }
+    mapPinch = nextPinch;
+  } else {
+    mapView.panX += p.x - previous.x;
+    mapView.panY += p.y - previous.y;
+    renderMapFrame();
+  }
+});
+
+function endMapPointer(ev) {
+  mapPointers.delete(ev.pointerId);
+  mapPinch = currentPinch();
+  if (!mapPointers.size) mapCanvas.classList.remove('dragging');
+}
+mapCanvas.addEventListener('pointerup', endMapPointer);
+mapCanvas.addEventListener('pointercancel', endMapPointer);
+mapCanvas.addEventListener('dblclick', ev => { ev.preventDefault(); resetMapView(); });
+mapCanvas.addEventListener('contextmenu', ev => ev.preventDefault());
+
+function renderMapFrame() {
+  const cv = mapCanvas, ctx = mctx;
+  if (!frame || !mapImg || !frame.map) return;
+  const meta = frame.map;
+  const pose = frame.pose || { x: 0, y: 0, yaw: 0 };
+  const view = getMapTransform();
+  const { dw, dh, dx, dy } = view;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#111519';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(mapImg, dx, dy, dw, dh);
+  // 位姿/轨迹 y 映射：地图 PNG 顶部 = 地图 y 最大（北），canvas y 向下 → y 镜像
+  const mapY = (y) => 1 - (y - meta.oy) / meta.res / meta.src_h;
+  // 位姿轨迹
+  if (trail.length > 1) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0,123,192,.72)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    trail.forEach((p, i) => {
+      const tx = dx + (p.x - meta.ox) / (meta.res * meta.src_w) * dw;
+      const ty = dy + mapY(p.y) * dh;
+      i ? ctx.lineTo(tx, ty) : ctx.moveTo(tx, ty);
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+  // 机器人箭头
+  const px = dx + (pose.x - meta.ox) / (meta.res * meta.src_w) * dw;
+  const py = dy + mapY(pose.y) * dh;
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(-pose.yaw);
+  ctx.beginPath();
+  ctx.moveTo(12, 0); ctx.lineTo(-8, -7); ctx.lineTo(-4, 0); ctx.lineTo(-8, 7);
+  ctx.closePath();
+  ctx.fillStyle = '#ea0016';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawMap() {
+  const cv = mapCanvas, ctx = mctx;
+  ctx.fillStyle = '#111519';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  if (!frame || !frame.map) return;
+  const meta = frame.map;
+  const png = frame.map_png;
+  if (png && png !== mapSrc) {
+    mapSrc = png;
+    const img = new Image();
+    img.onload = () => { mapImg = img; renderMapFrame(); };
+    img.src = png;
+  } else if (mapImg) {
+    renderMapFrame();
+  } else {
+    ctx.fillStyle = '#71767c';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('等待地图数据…', cv.width / 2, cv.height / 2);
+  }
+}
+
+// ---------- 雷达画面（前向朝上：车体坐标系，随狗转向） ----------
+function drawLidar() {
+  const cv = lidarCanvas, ctx = lctx;
+  ctx.fillStyle = '#111519';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = '#34414a';
+  ctx.lineWidth = 1;
+  const cx = cv.width / 2, cy = cv.height / 2;
+  const pxPerM = Math.min(cv.width, cv.height) / 10;
+  for (const r of [2.5, 5]) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * pxPerM, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (frame && frame.lidar && frame.lidar.length) {
+    const pts = frame.lidar;
+    ctx.fillStyle = '#007bc0';
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i += 2) {
+      const x = cx - pts[i + 1] * pxPerM;
+      const y = cy - pts[i] * pxPerM;
+      ctx.rect(x, y, 1.6, 1.6);
+    }
+    ctx.fill();
+  }
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.beginPath();
+  ctx.moveTo(0, -12); ctx.lineTo(-7, 8); ctx.lineTo(0, 4); ctx.lineTo(7, 8);
+  ctx.closePath();
+  ctx.fillStyle = '#ea0016';
+  ctx.fill();
+  ctx.restore();
+}
+
+// ============================================================
+//  导航页：静态 3D 地图 + 机器人/三类路径
+// ============================================================
+let navScene = null, navCamera = null, navRenderer = null, navControls = null;
+let navRobot = null, navActualLine = null, navGlobalLine = null, navLocalLine = null;
+let navPreviewLine = null, navPreviewStartMarker = null, navAlignmentMarker = null;
+let navGoalMarker = null, navGoalCandidate = null, navPickMode = 'goal';
+let navPreviewActive = false, navPreviewMessage = '';
+let navMapLoaded = false, navMapGeneration = 0, navMapLoadingGeneration = -1;
+let navStaticCloud = null, cameraTimer = null;
+
+function makePathLine(color, opacity, width) {
+  const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity, linewidth: width || 1 });
+  return new THREE.Line(new THREE.BufferGeometry(), material);
+}
+
+function initNav3D() {
+  if (navRenderer) return;
+  const el = $('navView3d');
+  const w = Math.max(2, el.clientWidth), h = Math.max(2, el.clientHeight);
+  navScene = new THREE.Scene();
+  navScene.background = new THREE.Color(0x111519);
+  navCamera = new THREE.PerspectiveCamera(58, w / h, 0.05, 250);
+  navCamera.position.set(8, 10, 8);
+  navRenderer = new THREE.WebGLRenderer({ antialias: true });
+  navRenderer.setSize(w, h);
+  navRenderer.setPixelRatio(window.devicePixelRatio || 1);
+  el.appendChild(navRenderer.domElement);
+  navControls = new THREE.OrbitControls(navCamera, navRenderer.domElement);
+  navControls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+  navControls.enableDamping = true;
+  navControls.dampingFactor = .08;
+  navControls.target.set(0, 0, 0);
+  navScene.add(new THREE.AxesHelper(1.5));
+  const grid = new THREE.GridHelper(50, 50, 0x52606a, 0x293138);
+  grid.position.y = -0.02;
+  navScene.add(grid);
+
+  navRobot = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(.55, .25, .32),
+    new THREE.MeshPhongMaterial({ color: 0xea0016, emissive: 0x3d0006 })
+  );
+  body.position.y = .22;
+  navRobot.add(body);
+  const heading = new THREE.Mesh(
+    new THREE.ConeGeometry(.15, .45, 10),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  heading.rotation.z = -Math.PI / 2;
+  heading.position.set(.48, .24, 0);
+  navRobot.add(heading);
+  navScene.add(navRobot);
+  navScene.add(new THREE.HemisphereLight(0xffffff, 0x243047, 1.6));
+
+  navActualLine = makePathLine(0x007bc0, 1.0, 3);
+  navGlobalLine = makePathLine(0xd17900, 1.0, 3);
+  navLocalLine = makePathLine(0x9e2896, 1.0, 3);
+  navPreviewLine = makePathLine(0x00a38b, 1.0, 4);
+  navScene.add(navActualLine, navGlobalLine, navLocalLine, navPreviewLine);
+
+  navPreviewStartMarker = new THREE.Group();
+  const previewStartMaterial = new THREE.MeshBasicMaterial({
+    color: 0x00a38b, transparent: true, opacity: 1, depthTest: false,
+  });
+  const startRing = new THREE.Mesh(new THREE.TorusGeometry(.25, .055, 10, 32), previewStartMaterial);
+  startRing.rotation.x = Math.PI / 2;
+  startRing.position.y = .05;
+  const startCone = new THREE.Mesh(new THREE.ConeGeometry(.14, .42, 12), previewStartMaterial);
+  startCone.position.y = .28;
+  navPreviewStartMarker.add(startRing, startCone);
+  navPreviewStartMarker.visible = false;
+  navPreviewStartMarker.renderOrder = 20;
+  navScene.add(navPreviewStartMarker);
+
+  navAlignmentMarker = new THREE.Group();
+  const alignmentMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffcf00, transparent: true, opacity: 1, depthTest: false,
+  });
+  const alignmentRing = new THREE.Mesh(
+    new THREE.TorusGeometry(.32, .05, 10, 32), alignmentMaterial);
+  alignmentRing.rotation.x = Math.PI / 2;
+  alignmentRing.position.y = .055;
+  const alignmentHeading = new THREE.Mesh(
+    new THREE.ConeGeometry(.13, .48, 12), alignmentMaterial);
+  alignmentHeading.rotation.z = -Math.PI / 2;
+  alignmentHeading.position.set(.38, .08, 0);
+  navAlignmentMarker.add(alignmentRing, alignmentHeading);
+  navAlignmentMarker.visible = false;
+  navAlignmentMarker.renderOrder = 21;
+  navScene.add(navAlignmentMarker);
+
+  // 高对比目标旗标：地面圆环 + 立杆 + Bosch 红旗，始终绘制在点云前方。
+  navGoalMarker = new THREE.Group();
+  const goalMaterial = new THREE.MeshBasicMaterial({
+    color: 0xea0016, transparent: true, opacity: .98, depthTest: false,
+  });
+  const goalRing = new THREE.Mesh(new THREE.TorusGeometry(.28, .045, 10, 32), goalMaterial);
+  goalRing.rotation.x = Math.PI / 2;
+  goalRing.position.y = .045;
+  const goalPole = new THREE.Mesh(new THREE.CylinderGeometry(.025, .025, .8, 10), goalMaterial);
+  goalPole.position.y = .43;
+  const goalFlagShape = new THREE.Shape();
+  goalFlagShape.moveTo(0, 0); goalFlagShape.lineTo(.42, -.12);
+  goalFlagShape.lineTo(0, -.25); goalFlagShape.lineTo(0, 0);
+  const goalFlag = new THREE.Mesh(new THREE.ShapeGeometry(goalFlagShape), goalMaterial);
+  goalFlag.position.set(0, .82, .01);
+  goalFlag.rotation.y = -Math.PI / 2;
+  navGoalMarker.add(goalRing, goalPole, goalFlag);
+  navGoalMarker.visible = false;
+  navGoalMarker.renderOrder = 20;
+  navScene.add(navGoalMarker);
+
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const floor = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  navRenderer.domElement.addEventListener('dblclick', ev => {
+    const rect = navRenderer.domElement.getBoundingClientRect();
+    mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, navCamera);
+    const point = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(floor, point)) {
+      const mapPoint = {x:point.x, y:-point.z};
+      if (navPickMode === 'alignment') {
+        $('alignmentX').value = point.x.toFixed(2);
+        $('alignmentY').value = (-point.z).toFixed(2);
+        setAlignmentMarker(point.x, -point.z, Number($('alignmentYaw').value) || 0);
+        navPickMode = 'goal';
+        $('btnPickAlignment').textContent = '地图粗选位置';
+        toast(`粗选位置已填写: (${point.x.toFixed(2)}, ${(-point.z).toFixed(2)})，朝向不确定可留空`);
+      } else if (navPickMode === 'preview-start') {
+        $('previewStartX').value = point.x.toFixed(2);
+        $('previewStartY').value = (-point.z).toFixed(2);
+        setPreviewStartMarker(point.x, -point.z);
+        navPickMode = 'goal';
+        $('btnPickPreviewStart').textContent = '地图选起点';
+        toast(`假起点已填写: (${point.x.toFixed(2)}, ${(-point.z).toFixed(2)})`);
+      } else {
+        $('goalX').value = point.x.toFixed(2);
+        $('goalY').value = (-point.z).toFixed(2);
+        navGoalCandidate = { x: point.x, y: -point.z };
+        setNavGoalMarker(point.x, -point.z);
+        toast(`目标已填写: (${point.x.toFixed(2)}, ${(-point.z).toFixed(2)})`);
+      }
+    }
+  });
+}
+
+function setAlignmentMarker(x, y, yawDeg) {
+  if (!navAlignmentMarker || ![x, y, yawDeg].every(value => Number.isFinite(Number(value)))) return;
+  navAlignmentMarker.position.set(Number(x), 0, -Number(y));
+  navAlignmentMarker.rotation.y = Number(yawDeg) * Math.PI / 180;
+  navAlignmentMarker.visible = true;
+}
+
+function setPreviewStartMarker(x, y) {
+  if (!navPreviewStartMarker || !Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) return;
+  navPreviewStartMarker.position.set(Number(x), 0, -Number(y));
+  navPreviewStartMarker.visible = true;
+  $('btnClearPreview').disabled = false;
+}
+
+function setNavGoalMarker(x, y) {
+  if (!navGoalMarker || !Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) return;
+  navGoalMarker.position.set(Number(x), 0, -Number(y));
+  navGoalMarker.visible = true;
+}
+
+function clearNavGoalMarker() {
+  navGoalCandidate = null;
+  if (navGoalMarker) navGoalMarker.visible = false;
+}
+
+
+function resizeNav3D() {
+  if (!navRenderer || activeMode !== 'navigation') return;
+  const el = $('navView3d');
+  const w = el.clientWidth, h = el.clientHeight;
+  if (w < 2 || h < 2) return;
+  navRenderer.setSize(w, h);
+  navCamera.aspect = w / h;
+  navCamera.updateProjectionMatrix();
+}
+
+function invalidateNavigationMap() {
+  navMapLoaded = false;
+  navMapGeneration += 1;
+  if (!navStaticCloud) return;
+  if (navScene) navScene.remove(navStaticCloud);
+  navStaticCloud.geometry.dispose();
+  navStaticCloud.material.dispose();
+  navStaticCloud = null;
+}
+
+async function loadNavigationMap() {
+  if (navMapLoaded) return;
+  const generation = navMapGeneration;
+  if (navMapLoadingGeneration === generation) return;
+  navMapLoadingGeneration = generation;
+  try {
+    // The active baseline can change while this page stays open.  Use a unique
+    // URL as well as no-store so an hour-old point cloud is never reused.
+    const response = await fetch(`/api/navigation/map3d?v=${Date.now()}`, {cache: 'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    // An older request may finish after a baseline switch; ignore it entirely.
+    if (generation !== navMapGeneration) return;
+    const pts = data.points || [];
+    const count = (pts.length / 3) | 0;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const color = new THREE.Color();
+    for (let i = 0; i < count; i++) {
+      const x = pts[i * 3], y = pts[i * 3 + 1], z = pts[i * 3 + 2];
+      positions[i * 3] = x; positions[i * 3 + 1] = z; positions[i * 3 + 2] = -y;
+      if (z < .08) color.setRGB(.42, .46, .49); // 地面为中性灰，不作红点标注
+      else color.setHSL(.57 - Math.min(.42, z / 5.0), .76, .58);
+      colors[i * 3] = color.r; colors[i * 3 + 1] = color.g; colors[i * 3 + 2] = color.b;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    if (navStaticCloud) {
+      navScene.remove(navStaticCloud);
+      navStaticCloud.geometry.dispose(); navStaticCloud.material.dispose();
+    }
+    const cloud = new THREE.Points(geometry, new THREE.PointsMaterial({
+      size: .055, vertexColors: true, sizeAttenuation: true, transparent: true, opacity: .9,
+    }));
+    navStaticCloud = cloud;
+    navScene.add(cloud);
+    const bounds = data.bounds;
+    const cx = bounds.origin[0] + bounds.width * bounds.resolution / 2;
+    const cy = bounds.origin[1] + bounds.height * bounds.resolution / 2;
+    const span = Math.max(bounds.width, bounds.height) * bounds.resolution;
+    navControls.target.set(cx, 0, -cy);
+    navCamera.position.set(cx + span * .45, span * .55, -cy + span * .45);
+    navCamera.lookAt(cx, 0, -cy);
+    navMapLoaded = true;
+    $('navMapHint').textContent = `${data.point_count} 点 · ${data.source} · 左键旋转 · 中键平移 · 滚轮缩放 · 双击选目标`;
+  } catch (error) {
+    if (generation === navMapGeneration) toast('静态 3D 地图加载失败: ' + error, true);
+  } finally {
+    if (navMapLoadingGeneration === generation) navMapLoadingGeneration = -1;
+  }
+}
+
+function updateNavLine(line, flat, heightOffset) {
+  if (!line || !Array.isArray(flat)) return;
+  const vertices = new Float32Array(flat.length);
+  for (let i = 0; i < flat.length; i += 3) {
+    vertices[i] = flat[i];
+    vertices[i + 1] = flat[i + 2] + heightOffset;
+    vertices[i + 2] = -flat[i + 1];
+  }
+  line.geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  line.geometry.computeBoundingSphere();
+}
+
+function renderGlobalControls(chassis = {}) {
+  chassisEnabled = !!chassis.enabled;
+  const remoteTeleopEnabled = !!chassis.teleop_enabled && chassisEnabled;
+  const postureState = chassis.posture_state || 'movable';
+  const postureBusy = postureRequestPending || !!chassis.posture_busy ||
+    !!chassis.posture_pending || postureState === 'preparing' ||
+    postureState === 'locking_for_lie' || postureState === 'standing_locked' ||
+    postureState === 'recovering';
+  const postureMovable = postureState === 'movable';
+  if (teleopEnabled && !remoteTeleopEnabled) stopTeleopTransmit();
+  $('teleopToggle').checked = remoteTeleopEnabled;
+  $('teleopToggle').disabled = (remoteTeleopEnabled && !teleopEnabled) ||
+    (!remoteTeleopEnabled && !chassis.connected) || postureBusy || !postureMovable;
+  $('teleopBox').classList.toggle('enabled', remoteTeleopEnabled);
+  $('btnStandDown').disabled = !chassis.connected || postureBusy ||
+    postureState === 'stand_down';
+  $('btnRecoveryStand').disabled = !chassis.connected || postureBusy;
+  const teleopLimits = Array.isArray(chassis.teleop_limits) ?
+    chassis.teleop_limits : [0.40, 0.10, 0.45];
+  const postureRetry = Number(chassis.posture_retry_count || 0);
+  const postureRetryText = chassis.sport_request_pending &&
+    Number(chassis.last_sport_response_code) === -1 && postureRetry > 0 ?
+    ` · Sport API 忙，正在重试 ${postureRetry}` : '';
+  if (postureState === 'locking_for_lie') {
+    const remaining = chassis.posture_recovery_remaining;
+    $('teleopStatus').textContent = `卧倒第一阶段：正在切换到站立关节锁定 mode=6${postureRetryText}${remaining == null ? '' : ` · 最长等待 ${Number(remaining).toFixed(1)} s`}`;
+  } else if (postureState === 'lying_down') {
+    const remaining = chassis.posture_recovery_remaining;
+    $('teleopStatus').textContent = `卧倒第二阶段：正在等待 Sport mode=5 确认${postureRetryText}${remaining == null ? '' : ` · 最长等待 ${Number(remaining).toFixed(1)} s`}`;
+  } else if (postureState === 'stand_down') {
+    $('teleopStatus').textContent = '已卧倒；底盘锁定，请点击“恢复可移动姿态”';
+  } else if (postureState === 'standing_locked' || postureState === 'recovering' ||
+             postureState === 'preparing') {
+    const remaining = chassis.posture_recovery_remaining;
+    const countdown = `${postureRetryText}${remaining == null ? '' : ` · 最长等待 ${Number(remaining).toFixed(1)} s`}`;
+    $('teleopStatus').textContent = postureState === 'standing_locked' ?
+      `第一阶段：正在站立，等待关节锁定动作完成${countdown}` :
+      (postureState === 'recovering' ?
+        `第二阶段：已站立，正在恢复可移动状态${countdown}` :
+        '正在停车并准备姿态动作');
+  } else if (postureState === 'recovery_failed') {
+    $('teleopStatus').textContent = `姿态动作未完成（Sport mode ${chassis.sport_mode == null ? '--' : chassis.sport_mode}）；底盘已锁定，请重试对应动作`;
+  } else {
+    $('teleopStatus').textContent = remoteTeleopEnabled ?
+      (teleopEnabled ? `已启用 · 速度上限 ${Number(teleopLimits[0]).toFixed(2)} / ${Number(teleopLimits[1]).toFixed(2)} m/s，转向 ${Number(teleopLimits[2]).toFixed(2)} rad/s` :
+        '另一个网页正在使用键盘控制') :
+      '已关闭；全局可用，无需地图定位，开启会取消路径导航并启用底盘';
+  }
+  return remoteTeleopEnabled;
+}
+
+function renderNavigation(data) {
+  navFrame = data;
+  const p = data.pose || {};
+  if (navRobot) {
+    navRobot.position.set(p.x || 0, Math.max(0, (p.z || .45) - .4), -(p.y || 0));
+    navRobot.rotation.y = p.yaw || 0;
+  }
+  if (Array.isArray(data.actual_path)) updateNavLine(navActualLine, data.actual_path, .04);
+  if (Array.isArray(data.global_path)) updateNavLine(navGlobalLine, data.global_path, .08);
+  if (Array.isArray(data.local_path)) updateNavLine(navLocalLine, data.local_path, .06);
+  if (data.goal) {
+    navGoalCandidate = null;
+    setNavGoalMarker(data.goal.x, data.goal.y);
+  } else if (!navGoalCandidate && !navPreviewActive) {
+    // No server-side goal means navigation has ended (arrival, cancellation,
+    // or safety stop). Do not leave the previous target marker on the map.
+    clearNavGoalMarker();
+  }
+  const deg = 180 / Math.PI;
+  $('navSpeed').textContent = `${(p.speed || 0).toFixed(3)} m/s`;
+  $('navYawRate').textContent = `${((p.yaw_rate || 0) * deg).toFixed(1)} °/s`;
+  $('navPosition').textContent = `${(p.x || 0).toFixed(2)} / ${(p.y || 0).toFixed(2)} / ${(p.z || 0).toFixed(2)}`;
+  $('navAttitude').textContent = `${((p.roll || 0) * deg).toFixed(1)}° / ${((p.pitch || 0) * deg).toFixed(1)}° / ${((p.yaw || 0) * deg).toFixed(1)}°`;
+  const state = data.state || {};
+  $('navSoc').textContent = state.soc == null ? '-- %' : `${state.soc} %`;
+  $('navPower').textContent = `${state.voltage == null ? '--' : state.voltage.toFixed(1)} V / ${state.current == null ? '--' : state.current.toFixed(1)} A / ${state.imu_temp == null ? '--' : state.imu_temp} ℃`;
+  $('routeStatus').textContent = navPreviewActive ? navPreviewMessage : (data.route_message || '等待设置目标点');
+  $('btnCancelNavigation').disabled = !data.goal;
+  const h = data.health || {}, cam = h.camera || {};
+  const alignment = h.alignment || {};
+  const chassis = h.chassis || data.chassis || {};
+  const remoteTeleopEnabled = renderGlobalControls(chassis);
+  $('btnChassisEnable').textContent = remoteTeleopEnabled ? '键盘控制占用底盘' :
+    (chassisEnabled ? '立即锁定底盘' : '启用真实底盘');
+  $('btnChassisEnable').className = chassisEnabled && !remoteTeleopEnabled ? 'danger-action' : '';
+  // The enable API starts SCAN first, then waits for odometry health before
+  // arming.  Therefore an odometry-not-ready state must not disable this entry.
+  $('btnChassisEnable').disabled = remoteTeleopEnabled || (!chassisEnabled && (!chassis.connected || !alignment.valid));
+  $('btnPlan').disabled = !chassisEnabled || remoteTeleopEnabled;
+  $('btnPlan').title = remoteTeleopEnabled ? '请先关闭键盘控制' : (chassisEnabled ? '规划并发送真实导航目标' :
+    '请先启用真实底盘，再规划并发送');
+  $('navChassisHealth').textContent = remoteTeleopEnabled ? '键盘控制已启用' :
+    (chassisEnabled ? '已启用' : (chassis.connected ? `锁定 · ${chassis.reason || '待命'}` : '安全门离线'));
+  if (cam.running) startCameraPolling();
+  else stopCameraPolling();
+  $('navPoseHealth').textContent = h.pose_online ? `在线 (${h.pose_age.toFixed(2)}s)` : '离线';
+  $('navAlignmentHealth').textContent = alignment.valid ? '本次开机已标定' : (alignment.reason || '未标定');
+  const aq = alignment.quality || {};
+  const alignmentResultText = alignment.valid && alignment.method === 'auto_icp' ?
+    `自动精配准已通过 · 30 cm 重合率 ${((aq.inlier_ratio_30cm || 0)*100).toFixed(1)}% · RMSE ${(aq.rmse_m || 0).toFixed(3)} m · ${aq.matched_points || 0} 匹配点` :
+    (alignment.valid ? '已标定' : '未进行本次开机自动定位');
+  if (alignmentRequestUi) {
+    if (!alignment.valid) {
+      alignmentRequestUi.sawInvalid = true;
+      $('alignmentQuality').textContent = alignment.reason || '正在采集点云并自动精配准…';
+    } else if (alignmentRequestUi.sawInvalid) {
+      alignmentRequestUi.completed = true;
+      $('alignmentQuality').textContent = alignmentResultText;
+      const alignmentButton = $('btnSaveAlignment');
+      alignmentButton.textContent = '配准已完成，正在恢复导航…';
+    } else {
+      // A previous valid alignment can remain visible briefly while the
+      // backend prepares capture.  Do not mistake that old result for this run.
+      $('alignmentQuality').textContent = '正在准备自动精配准…';
+    }
+  } else {
+    $('alignmentQuality').textContent = alignmentResultText;
+  }
+  if (navRobot && !navPreviewActive) navRobot.visible = !!alignment.valid;
+  if (alignment.valid && alignment.map_pose) {
+    const ap = alignment.map_pose;
+    if (!$('alignmentX').value) $('alignmentX').value = Number(ap.x).toFixed(2);
+    if (!$('alignmentY').value) $('alignmentY').value = Number(ap.y).toFixed(2);
+    if (!$('alignmentYaw').value) $('alignmentYaw').placeholder = `精配准结果 ${Number(ap.yaw_deg).toFixed(1)}°`;
+    if (navAlignmentMarker) navAlignmentMarker.visible = false;
+  }
+  $('navPlannerHealth').textContent = h.planner_active ? (remoteTeleopEnabled ? 'SCAN 在线（键盘控制）' : (chassisEnabled ? 'SCAN 在线（实机）' : 'SCAN 在线（隔离）')) : '已停止';
+  $('navLocalHealth').textContent = h.local_path_online ? '在线' : '等待规划';
+  $('navCameraHealth').textContent = cam.online ? '在线' : (cam.running ? '等待画面' : '已关闭');
+  $('cameraStatus').textContent = cam.online ? `实时 JPEG · ${cam.age.toFixed(2)}s` : '等待 VideoClient';
+  $('bdEngine').innerHTML = `<span class="dot"></span>规划器: ${h.planner_active ? 'SCAN 在线' : '已停止'}`;
+  $('bdEngine').className = `badge ${h.planner_active ? 'on' : 'offline'}`;
+  $('bdMap').innerHTML = '<span class="dot"></span>地图: 3D 静态地图';
+  $('bdMap').className = `badge ${navMapLoaded ? 'on' : ''}`;
+  $('bdMapping').innerHTML = `<span class="dot"></span>导航: ${h.dry_run ? '安全干跑' : '运行中'}`;
+  $('bdMapping').className = `badge ${h.planner_active ? 'mapping' : 'offline'}`;
+}
+
+async function toggleChassis() {
+  const enable = !chassisEnabled;
+  if (enable) {
+    const warning = '即将启用真实底盘。请确认机器狗已站稳、周围无人、遥控器急停可用，并且当前地图将未知区域全部视为可通行。是否继续？';
+    if (!window.confirm(warning)) return;
+  }
+  const button = $('btnChassisEnable');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/navigation/chassis', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: enable}),
+    });
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+  } catch (error) {
+    toast('底盘开关失败: ' + error, true);
+  }
+}
+
+function updateTeleopKeycaps() {
+  document.querySelectorAll('[data-teleop-key]').forEach(element => {
+    element.classList.toggle('active', teleopKeys.has(element.dataset.teleopKey));
+  });
+}
+
+function currentTeleopAxes() {
+  return {
+    forward: (teleopKeys.has('w') ? 1 : 0) - (teleopKeys.has('s') ? 1 : 0),
+    lateral: (teleopKeys.has('a') ? 1 : 0) - (teleopKeys.has('d') ? 1 : 0),
+    turn: (teleopKeys.has('q') ? 1 : 0) - (teleopKeys.has('e') ? 1 : 0),
+  };
+}
+
+function sendTeleopAxes(axes) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify({type:'teleop', client_id:teleopClientId, ...axes}));
+  return true;
+}
+
+function sendTeleopCommand() {
+  if (!teleopEnabled) return;
+  sendTeleopAxes(currentTeleopAxes());
+}
+
+function startTeleopTransmit() {
+  clearInterval(teleopTimer);
+  teleopKeys.clear();
+  updateTeleopKeycaps();
+  sendTeleopAxes({forward:0, lateral:0, turn:0});
+  teleopTimer = setInterval(sendTeleopCommand, 100);
+}
+
+function stopTeleopTransmit() {
+  if (teleopEnabled) sendTeleopAxes({forward:0, lateral:0, turn:0});
+  teleopEnabled = false;
+  clearInterval(teleopTimer);
+  teleopTimer = null;
+  teleopKeys.clear();
+  updateTeleopKeycaps();
+}
+
+async function toggleTeleop(skipConfirmation = false) {
+  const toggle = $('teleopToggle');
+  const enable = toggle.checked;
+  if (enable) {
+    const warning = '即将取消当前路径导航并启用真实底盘的键盘控制。请确认机器狗已站稳、周围无人、遥控器急停可用。页面失焦或网络断开会自动停车。是否继续？';
+    if (!skipConfirmation && !window.confirm(warning)) {
+      toggle.checked = false;
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      toggle.checked = false;
+      toast('WebSocket 尚未连接，不能启用键盘控制', true);
+      return;
+    }
+  } else {
+    stopTeleopTransmit();
+  }
+  toggle.disabled = true;
+  try {
+    const response = await fetch('/api/navigation/teleop', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled:enable, client_id:teleopClientId}),
+    });
+    const result = await response.json();
+    if (result.success && enable) {
+      teleopEnabled = true;
+      startTeleopTransmit();
+      toggle.blur();
+    } else if (!result.success) {
+      stopTeleopTransmit();
+      toggle.checked = false;
+    }
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+  } catch (error) {
+    stopTeleopTransmit();
+    toggle.checked = false;
+    toast('键盘控制开关失败: ' + error, true);
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
+async function waitForMovablePosture(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (document.hidden) return false;
+    try {
+      const response = await fetch('/api/navigation/chassis', {cache:'no-store'});
+      const status = await response.json();
+      if (!status.posture_pending && status.posture_state === 'movable') return true;
+      if (status.posture_state === 'recovery_failed') return false;
+    } catch (_) {}
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+async function resumeTeleopAfterRecovery() {
+  const movable = await waitForMovablePosture();
+  if (!movable) {
+    toast('两阶段恢复未确认完成，底盘保持锁定；请不要强制开启移动，可重试“恢复可移动姿态”', true);
+    return false;
+  }
+  if (document.hidden || !document.hasFocus() || !ws ||
+      ws.readyState !== WebSocket.OPEN) {
+    toast('机器狗已站立，但页面不在前台或 WebSocket 未连接；底盘保持锁定', true);
+    return false;
+  }
+  $('teleopToggle').checked = true;
+  await toggleTeleop(true);
+  return teleopEnabled;
+}
+
+async function requestPosture(action) {
+  if (postureRequestPending) return;
+  const standDown = action === 'stand_down';
+  const warning = standDown ?
+    '将立即清零速度、取消导航并锁定底盘，然后让机器狗卧倒。请确认地面平整，机器狗四周无人和障碍物。是否继续？' :
+    '将执行两阶段恢复：先从卧倒到站立锁定状态，确认站立动作完成后，再恢复可移动状态。请确认机器狗上方和四周无障碍物。两阶段都完成后，当前网页才会自动重新启用键盘控制，并保持零速度直到你按键。是否继续？';
+  if (!window.confirm(warning)) return;
+
+  // Stop the browser command stream before the HTTP request.  The server and
+  // chassis gate repeat this stop independently as separate safety layers.
+  stopTeleopTransmit();
+  $('teleopToggle').checked = false;
+  postureRequestPending = true;
+  $('btnStandDown').disabled = true;
+  $('btnRecoveryStand').disabled = true;
+  try {
+    const response = await fetch('/api/navigation/posture', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({action, client_id:teleopClientId}),
+    });
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+    if (result.success && !standDown) {
+      const resumed = await resumeTeleopAfterRecovery();
+      if (resumed) toast('✓ 已恢复可移动姿态，键盘控制已启用');
+    }
+  } catch (error) {
+    toast('姿态动作请求失败: ' + error, true);
+  } finally {
+    postureRequestPending = false;
+  }
+}
+
+async function disableTeleopForSafety(reason) {
+  if (!teleopEnabled || teleopDisablePending) return;
+  teleopDisablePending = true;
+  stopTeleopTransmit();
+  $('teleopToggle').checked = false;
+  try {
+    await fetch('/api/navigation/teleop', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled:false, client_id:teleopClientId}),
+      keepalive: true,
+    });
+  } catch (_) {}
+  teleopDisablePending = false;
+  if (reason) toast(reason + '，键盘控制已关闭并锁定底盘', true);
+}
+
+document.addEventListener('keydown', event => {
+  const key = String(event.key || '').toLowerCase();
+  if (!teleopEnabled || !teleopKeyNames.has(key)) return;
+  const target = event.target;
+  const typing = target && (target.matches('textarea, select, [contenteditable="true"]') ||
+    (target.matches('input') && target.id !== 'teleopToggle'));
+  if (typing) return;
+  event.preventDefault();
+  teleopKeys.add(key);
+  updateTeleopKeycaps();
+  sendTeleopCommand();
+});
+
+document.addEventListener('keyup', event => {
+  const key = String(event.key || '').toLowerCase();
+  if (!teleopKeyNames.has(key)) return;
+  if (teleopEnabled) event.preventDefault();
+  teleopKeys.delete(key);
+  updateTeleopKeycaps();
+  sendTeleopCommand();
+});
+
+window.addEventListener('blur', () => disableTeleopForSafety('页面已失焦'));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) disableTeleopForSafety('页面已转入后台');
+});
+
+function startCameraPolling() {
+  if (cameraTimer) return;
+  const image = $('frontCamera');
+  image.onload = () => image.classList.add('online');
+  image.onerror = () => image.classList.remove('online');
+  const update = () => {
+    if (activeMode === 'navigation') image.src = `/api/navigation/camera.jpg?t=${Date.now()}`;
+  };
+  update();
+  cameraTimer = setInterval(update, 250);
+}
+
+function stopCameraPolling() {
+  clearInterval(cameraTimer);
+  cameraTimer = null;
+  $('frontCamera').classList.remove('online');
+  $('frontCamera').removeAttribute('src');
+}
+
+async function planGoal() {
+  if (!chassisEnabled) {
+    toast('底盘仍在锁定状态；请先点“启用真实底盘”，等状态变为“已启用”后再发送目标', true);
+    return;
+  }
+  const x = Number($('goalX').value), y = Number($('goalY').value);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    toast('请输入有效的目标 X / Y，或在 3D 地面上双击', true); return;
+  }
+  const button = $('btnPlan');
+  clearNavigationPreview(false);
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/navigation/goal', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x, y}),
+    });
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+    if (result.goal) {
+      $('goalX').value = result.goal.x;
+      $('goalY').value = result.goal.y;
+      navGoalCandidate = null;
+      setNavGoalMarker(result.goal.x, result.goal.y);
+    }
+  } catch (error) { toast('规划请求失败: ' + error, true); }
+  button.disabled = !chassisEnabled;
+}
+
+function clearNavigationPreview(clearFields=true) {
+  navPreviewActive = false;
+  navPreviewMessage = '';
+  if (navRobot) navRobot.visible = true;
+  if (navPreviewLine) updateNavLine(navPreviewLine, [], .10);
+  if (navPreviewStartMarker) navPreviewStartMarker.visible = false;
+  if (clearFields) {
+    $('previewStartX').value = '';
+    $('previewStartY').value = '';
+  }
+  $('btnClearPreview').disabled = true;
+  $('routeStatus').textContent = (navFrame && navFrame.route_message) || '等待设置目标点';
+}
+
+async function previewPlan() {
+  const fields = [$('previewStartX'), $('previewStartY'), $('goalX'), $('goalY')];
+  const values = fields.map(field => field.value.trim());
+  if (values.some(value => value === '')) {
+    toast('请输入假起点和目标坐标，或在地图上选择', true); return;
+  }
+  const [startX, startY, goalX, goalY] = values.map(Number);
+  if (![startX, startY, goalX, goalY].every(Number.isFinite)) {
+    toast('假起点或目标坐标无效', true); return;
+  }
+  const button = $('btnPreviewPlan');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/navigation/preview', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({start_x:startX, start_y:startY, goal_x:goalX, goal_y:goalY}),
+    });
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+    if (result.success && result.preview) {
+      const preview = result.preview;
+      $('previewStartX').value = preview.start.x;
+      $('previewStartY').value = preview.start.y;
+      $('goalX').value = preview.goal.x;
+      $('goalY').value = preview.goal.y;
+      setPreviewStartMarker(preview.start.x, preview.start.y);
+      navGoalCandidate = {x:preview.goal.x, y:preview.goal.y};
+      setNavGoalMarker(preview.goal.x, preview.goal.y);
+      updateNavLine(navPreviewLine, preview.path || [], .10);
+      if (navRobot) navRobot.visible = false;
+      navPreviewActive = true;
+      navPreviewMessage = result.message;
+      $('routeStatus').textContent = result.message;
+      $('btnClearPreview').disabled = false;
+    }
+  } catch (error) { toast('离线预演失败: ' + error, true); }
+  button.disabled = false;
+}
+
+function togglePreviewStartPick() {
+  navPickMode = navPickMode === 'preview-start' ? 'goal' : 'preview-start';
+  $('btnPickPreviewStart').textContent = navPickMode === 'preview-start' ? '双击地图…' : '地图选起点';
+  toast(navPickMode === 'preview-start' ? '请在 3D 地图地面上双击假起点' : '已取消选择假起点');
+}
+
+function toggleAlignmentPick() {
+  navPickMode = navPickMode === 'alignment' ? 'goal' : 'alignment';
+  $('btnPickAlignment').textContent = navPickMode === 'alignment' ? '双击地图…' : '地图粗选位置';
+  toast(navPickMode === 'alignment' ? '请在 3D 地图地面上双击机器人大致所在区域' : '已取消粗选位置');
+}
+
+async function saveAlignment() {
+  const x = Number($('alignmentX').value);
+  const y = Number($('alignmentY').value);
+  const yawText = $('alignmentYaw').value.trim();
+  const yawDeg = yawText === '' ? null : Number(yawText);
+  if (![x, y].every(Number.isFinite) || (yawDeg !== null && !Number.isFinite(yawDeg))) {
+    toast('请在地图中粗选当前 X / Y；朝向不确定可留空', true); return;
+  }
+  const yawDescription = yawDeg === null ? '全方向自动搜索' : `大致朝向 ${yawDeg.toFixed(1)}°`;
+  const warning = `将以粗选区域 (${x.toFixed(2)}, ${y.toFixed(2)}) 为中心，${yawDescription}，采集数秒雷达点云与静态 3D 地图精配准。\n操作会锁定底盘、清除旧路径并重启 SCAN；请保持机器人静止。`;
+  if (!window.confirm(warning)) return;
+  const button = $('btnSaveAlignment');
+  const previousAlignment = navFrame && navFrame.health && navFrame.health.alignment;
+  alignmentRequestUi = {
+    sawInvalid: !(previousAlignment && previousAlignment.valid),
+    completed: false,
+  };
+  button.disabled = true;
+  button.textContent = '正在采集与精配准…';
+  $('alignmentQuality').textContent = '正在采集 8 帧实时点云并计算精配准…';
+  try {
+    const response = await fetch('/api/navigation/alignment', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x, y, yaw_deg:yawDeg}),
+    });
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+    if (result.registration && result.registration.quality) {
+      const q = result.registration.quality;
+      const registrationPassed = result.success ||
+        !!(result.alignment && result.alignment.valid);
+      $('alignmentQuality').textContent = `${registrationPassed ? '通过' : '未通过'} · 30 cm 重合率 ${(q.inlier_ratio_30cm*100).toFixed(1)}% · RMSE ${q.rmse_m.toFixed(3)} m · ${q.matched_points} 匹配点`;
+    }
+    if (result.success) {
+      navPickMode = 'goal';
+      if (navAlignmentMarker) navAlignmentMarker.visible = false;
+    }
+  } catch (error) { toast('位姿标定失败: ' + error, true); }
+  alignmentRequestUi = null;
+  button.disabled = false;
+  button.textContent = '采集点云并自动精配准';
+}
+
+async function cancelNavigation() {
+  const button = $('btnCancelNavigation');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/navigation/cancel', {method: 'POST'});
+    const result = await response.json();
+    toast((result.success ? '✓ ' : '✗ ') + result.message, !result.success);
+    if (result.success) {
+      $('goalX').value = '';
+      $('goalY').value = '';
+      $('routeStatus').textContent = '导航已取消，请重新设置目标点';
+      navGoalCandidate = null;
+      clearNavGoalMarker();
+      updateNavLine(navGlobalLine, [], .08);
+      updateNavLine(navLocalLine, [], .06);
+    } else {
+      button.disabled = false;
+    }
+  } catch (error) {
+    toast('取消导航失败: ' + error, true);
+    button.disabled = false;
+  }
+}
+
+function showMode(mode, modeData) {
+  const previousMode = activeMode;
+  activeMode = ['mapping', 'navigation', 'maps'].includes(mode) ? mode : 'mapping';
+  const navigation = activeMode === 'navigation';
+  const mapping = activeMode === 'mapping';
+  const maps = activeMode === 'maps';
+  $('mappingPage').classList.toggle('hidden', !mapping);
+  $('mappingFooter').classList.toggle('hidden', !mapping);
+  $('navigationPage').classList.toggle('hidden', !navigation);
+  $('navigationFooter').classList.toggle('hidden', !navigation);
+  $('mapsPage').classList.toggle('hidden', !maps);
+  $('tabMapping').classList.toggle('active', mapping);
+  $('tabNavigation').classList.toggle('active', navigation);
+  $('tabMaps').classList.toggle('active', maps);
+  $('pageTitle').textContent = navigation ? 'GO2-W 导航控制台' :
+    (maps ? 'GO2-W 地图管理' : 'GO2-W 建图控制台');
+  if (modeData && typeof modeData.mapping_active === 'boolean') {
+    mappingActive = modeData.mapping_active;
+    updateMappingButtons();
+  }
+  if (navigation) {
+    // A navigation baseline can only be changed from the map page.  Therefore
+    // every maps -> navigation transition must discard the previous point cloud.
+    if (previousMode !== 'navigation') invalidateNavigationMap();
+    initNav3D();
+    requestAnimationFrame(() => { resizeNav3D(); loadNavigationMap(); });
+  } else if (mapping) {
+    stopCameraPolling();
+    clearNavigationPreview(true);
+    clearNavGoalMarker();
+    requestAnimationFrame(() => { resize3D(); fitCanvas(mapCanvas); fitCanvas(lidarCanvas); drawMap(); drawLidar(); });
+  } else {
+    stopCameraPolling();
+    clearNavigationPreview(true);
+    clearNavGoalMarker();
+    refreshMapLibrary();
+    try {
+      initLibrary3D();
+      requestAnimationFrame(resizeLibrary3D);
+    } catch (error) {
+      console.warn('3D preview unavailable:', error);
+    }
+  }
+}
+
+async function requestMode(target) {
+  if (target === activeMode) return;
+  const targetLabel = {mapping:'建图', navigation:'导航', maps:'地图管理'}[target];
+  let saveName = null;
+  if (activeMode === 'mapping' && mappingActive) {
+    saveName = window.prompt(`切换到${targetLabel}会终止并保存当前建图。请输入地图名：`, suggestedMapName());
+    if (saveName === null) return;
+    saveName = saveName.trim();
+    if (!saveName) { toast('地图名不能为空', true); return; }
+  }
+  let confirmMessage = null;
+  if (activeMode === 'navigation') {
+    confirmMessage = `切换到${targetLabel}会停止 SCAN 导航、清除当前目标和路径，并关闭摄像头。${teleopEnabled ? '顶部键盘控制会保持启用。' : ''}是否继续？`;
+  } else if (target === 'navigation') {
+    confirmMessage = '切换到导航会保持建图关闭；离线预演不会启动 SCAN、摄像头或 ROS 路径。是否继续？';
+  } else if (activeMode === 'mapping' && mappingActive) {
+    confirmMessage = `切换到${targetLabel}会保存并终止当前建图。是否继续？`;
+  }
+  // 地图管理 → 建图只是进入页面，建图仍保持关闭，无需安全确认。
+  if (confirmMessage && !window.confirm(confirmMessage)) return;
+  $('tabMapping').disabled = $('tabNavigation').disabled = $('tabMaps').disabled = true;
+  try {
+    const response = await fetch('/api/mode', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: target, save_name: saveName}),
+    });
+    const result = await response.json();
+    if (result.success) {
+      showMode(result.mode);
+      mappingActive = false;
+      updateMappingButtons();
+      toast('✓ ' + result.message);
+    } else toast('✗ ' + result.message, true);
+  } catch (error) { toast('模式切换失败: ' + error, true); }
+  $('tabMapping').disabled = $('tabNavigation').disabled = $('tabMaps').disabled = false;
+}
+
+// ---------- 状态栏 ----------
+function renderStatus() {
+  if (!frame) return;
+  const pose = frame.pose || { x: 0, y: 0, z: 0, yaw: 0 };
+  const h = frame.health || {};
+  $('stPose').textContent = h.pose_valid
+    ? `x=${pose.x.toFixed(2)} y=${pose.y.toFixed(2)} z=${(pose.z || 0).toFixed(2)} yaw=${(pose.yaw * 180 / Math.PI).toFixed(1)}°`
+    : '--';
+  $('stLidar').textContent = `${(frame.lidar_rate || 0).toFixed(1)} Hz`;
+  const ms = frame.map_stats || {};
+  $('stMap').textContent = ms.pts ? `${ms.pts} 点 · ${ms.range}` : '--';
+  $('bdEngine').innerHTML = `<span class="dot"></span>引擎: ${h.pose_online ? 'LIO-SAM 在线' : '离线'}`;
+  $('bdEngine').className = `badge ${h.pose_online ? 'on' : 'offline'}`;
+  $('bdMap').innerHTML = `<span class="dot"></span>地图: ${h.map_online ? 'global_map' : '无数据'}`;
+  $('bdMap').className = `badge ${h.map_online ? 'on' : 'offline'}`;
+  const mappingHealthy = mappingActive && h.healthy;
+  $('bdMapping').innerHTML = `<span class="dot"></span>建图: ${mappingActive ? (h.healthy ? '运行中' : '等待数据') : '已关闭'}`;
+  $('bdMapping').className = `badge ${mappingHealthy ? 'mapping' : ''}`;
+  $('stOpLine').style.display = h.error ? '' : 'none';
+  $('stOp').textContent = h.error || '--';
+  $('btnSave').disabled = !mappingHealthy;
+}
+
+// ---------- 消息 ----------
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = (isErr ? 'err ' : '') + 'show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = '', 4000);
+}
+
+// ---------- 建图启停 / 命名保存 ----------
+function suggestedMapName() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `map_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+function updateMappingButtons() {
+  $('btnMappingStart').disabled = mappingActive;
+  $('btnMappingStop').disabled = !mappingActive;
+  if (!mappingActive) $('btnSave').disabled = true;
+}
+
+async function mappingAction(action) {
+  try {
+    const r = await fetch('/api/mapping', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({action}),
+    });
+    const j = await r.json();
+    if (j.success) {
+      mappingActive = !!j.active;
+      updateMappingButtons();
+      toast('✓ ' + j.message);
+    } else toast('✗ ' + j.message, true);
+  } catch (e) { toast('建图操作失败: ' + e, true); }
+}
+
+async function saveMap() {
+  const name = window.prompt('请输入保存地图名：', suggestedMapName());
+  if (name === null) return;
+  if (!name.trim()) { toast('地图名不能为空', true); return; }
+  const btn = $('btnSave');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/save', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name: name.trim()}),
+    });
+    const j = await r.json();
+    if (j.success) { toast('✓ ' + j.message); }
+    else toast('✗ ' + j.message, true);
+  } catch (e) {
+    toast('请求失败: ' + e, true);
+  }
+  btn.disabled = false;
+}
+
+// ============================================================
+//  地图管理：只列名称，按需加载一次性 2D/3D 静态预览
+// ============================================================
+let libraryScene = null, libraryCamera = null, libraryRenderer = null, libraryControls = null;
+let libraryCloud = null, libraryCurrentName = null;
+let libraryPreviewData = null, libraryEraseMode = false, libraryEraseDrag = null;
+let libraryEraseSelections = [], libraryEraseDraft = null;
+const library2dView = { zoom: 1, panX: 0, panY: 0 };
+
+function initLibrary3D() {
+  if (libraryRenderer) return;
+  const el = $('libraryView3d');
+  const w = Math.max(2, el.clientWidth), h = Math.max(2, el.clientHeight);
+  libraryScene = new THREE.Scene();
+  libraryScene.background = new THREE.Color(0x111519);
+  libraryCamera = new THREE.PerspectiveCamera(58, w / h, .05, 300);
+  libraryCamera.position.set(8, 8, 8);
+  libraryRenderer = new THREE.WebGLRenderer({antialias:true});
+  libraryRenderer.setSize(w, h);
+  libraryRenderer.setPixelRatio(window.devicePixelRatio || 1);
+  el.insertBefore(libraryRenderer.domElement, el.firstChild);
+  libraryControls = new THREE.OrbitControls(libraryCamera, libraryRenderer.domElement);
+  libraryControls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+  libraryControls.enableDamping = true;
+  libraryControls.dampingFactor = .08;
+  const grid = new THREE.GridHelper(40, 40, 0x52606a, 0x293138);
+  grid.position.y = -.02;
+  libraryScene.add(grid, new THREE.AxesHelper(1.5));
+}
+
+function resizeLibrary3D() {
+  if (!libraryRenderer || activeMode !== 'maps') return;
+  const el = $('libraryView3d'), w = el.clientWidth, h = el.clientHeight;
+  if (w < 2 || h < 2) return;
+  libraryRenderer.setSize(w, h);
+  libraryCamera.aspect = w / h;
+  libraryCamera.updateProjectionMatrix();
+}
+
+function setLibraryCloud(flat, resetView=true) {
+  if (libraryCloud) {
+    libraryScene.remove(libraryCloud);
+    libraryCloud.geometry.dispose();
+    libraryCloud.material.dispose();
+    libraryCloud = null;
+  }
+  const count = (flat.length / 3) | 0;
+  if (!count) return;
+  const positions = new Float32Array(count * 3), colors = new Float32Array(count * 3);
+  const color = new THREE.Color();
+  for (let i = 0; i < count; i++) {
+    const x=flat[i*3], y=flat[i*3+1], z=flat[i*3+2];
+    positions[i*3]=x; positions[i*3+1]=z; positions[i*3+2]=-y;
+    if (z < .08) color.setRGB(.42,.46,.49);
+    else color.setHSL(.57-Math.min(.42,z/5),.76,.58);
+    colors[i*3]=color.r; colors[i*3+1]=color.g; colors[i*3+2]=color.b;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position',new THREE.BufferAttribute(positions,3));
+  geometry.setAttribute('color',new THREE.BufferAttribute(colors,3));
+  libraryCloud = new THREE.Points(geometry,new THREE.PointsMaterial({
+    size:.055,vertexColors:true,sizeAttenuation:true,transparent:true,opacity:.92,
+  }));
+  libraryScene.add(libraryCloud);
+  if (!resetView) return;
+  geometry.computeBoundingBox();
+  const box=geometry.boundingBox, center=new THREE.Vector3(), size=new THREE.Vector3();
+  box.getCenter(center); box.getSize(size);
+  const span=Math.max(4,size.x,size.z);
+  libraryControls.target.copy(center);
+  libraryCamera.position.set(center.x+span*.55,Math.max(5,span*.55),center.z+span*.55);
+  libraryCamera.lookAt(center);
+}
+
+function resetLibrary2D() {
+  library2dView.zoom=1; library2dView.panX=0; library2dView.panY=0;
+  renderLibrary2D();
+}
+
+function libraryImageRect() {
+  const image=$('library2dImage');
+  return image && image.naturalWidth ? {
+    left:parseFloat(image.style.left)||0, top:parseFloat(image.style.top)||0,
+    width:parseFloat(image.style.width)||0, height:parseFloat(image.style.height)||0,
+  } : null;
+}
+
+function renderEraseBoxes() {
+  const overlay=$('libraryEraseOverlay'); overlay.replaceChildren();
+  const selections=libraryEraseDraft ? [...libraryEraseSelections,libraryEraseDraft] : libraryEraseSelections;
+  selections.forEach((selection,index)=>{
+    const points=eraseSelectionScreenPoints(selection); if(points.length<2)return;
+    const ns='http://www.w3.org/2000/svg';
+    const polygon=document.createElementNS(ns,'polygon');
+    polygon.setAttribute('points',points.map(point=>`${point.x},${point.y}`).join(' '));
+    polygon.setAttribute('class','library-erase-polygon'+(selection===libraryEraseDraft?' draft':''));
+    overlay.appendChild(polygon);
+    if(selection!==libraryEraseDraft){
+      const labelPoint=points[0], bg=document.createElementNS(ns,'circle'), label=document.createElementNS(ns,'text');
+      bg.setAttribute('cx',labelPoint.x);bg.setAttribute('cy',labelPoint.y);bg.setAttribute('r','10');bg.setAttribute('class','library-erase-label-bg');
+      label.setAttribute('x',labelPoint.x);label.setAttribute('y',labelPoint.y);label.setAttribute('class','library-erase-label');label.textContent=String(index+1);
+      overlay.append(bg,label);
+    }
+  });
+}
+
+function eraseSelectionScreenPoints(selection) {
+  if(!selection)return [];
+  if(!selection.normalized)return selection.points||[];
+  const rect=libraryImageRect();if(!rect)return [];
+  return selection.points.map(point=>({x:rect.left+point.u*rect.width,y:rect.top+point.v*rect.height}));
+}
+
+function normalizeEraseSelection(selection) {
+  const rect=libraryImageRect(); if (!selection || !rect || rect.width<=0 || rect.height<=0) return null;
+  const clamp=value=>Math.max(0,Math.min(1,value));
+  const points=(selection.points||[]).map(point=>({
+    u:clamp((point.x-rect.left)/rect.width),v:clamp((point.y-rect.top)/rect.height),
+  }));
+  const simplified=[];
+  points.forEach(point=>{
+    const last=simplified[simplified.length-1];
+    if(!last||Math.hypot((point.u-last.u)*rect.width,(point.v-last.v)*rect.height)>=3)simplified.push(point);
+  });
+  return {normalized:true,points:simplified};
+}
+
+function polygonArea(points) {
+  if(!points||points.length<3)return 0;
+  let sum=0;
+  for(let i=0;i<points.length;i++){const a=points[i],b=points[(i+1)%points.length];sum+=a.x*b.y-b.x*a.y;}
+  return Math.abs(sum)*.5;
+}
+
+function clearEraseSelection(disableMode=false) {
+  libraryEraseDrag=null; libraryEraseDraft=null; libraryEraseSelections=[];
+  if (disableMode) libraryEraseMode=false;
+  $('library2dStage').classList.toggle('erase-mode',libraryEraseMode);
+  $('btnEraseMode').textContent=libraryEraseMode?'继续手绘…':'手绘擦除';
+  $('btnEraseUndo').disabled=true;
+  $('btnEraseCancel').disabled=true;
+  $('btnEraseSave').disabled=true;
+  renderEraseBoxes();
+  applyLibraryErasePreview();
+}
+
+function toggleEraseMode() {
+  if (!libraryCurrentName || !libraryPreviewData) return;
+  libraryEraseMode=!libraryEraseMode;
+  libraryEraseDraft=null; libraryEraseDrag=null;
+  $('library2dStage').classList.toggle('erase-mode',libraryEraseMode);
+  $('btnEraseMode').textContent=libraryEraseMode?'继续手绘…':'继续手绘';
+  $('btnEraseUndo').disabled=!libraryEraseSelections.length;
+  $('btnEraseCancel').disabled=!libraryEraseSelections.length;
+  $('btnEraseSave').disabled=!libraryEraseSelections.length;
+  renderEraseBoxes();
+  if (libraryEraseSelections.length) applyLibraryErasePreview();
+  else $('libraryEraseNote').textContent=libraryEraseMode ?
+    '按住鼠标沿轮廓画，松开后立即预览 2D/3D 擦除效果' :
+    '仅删地面上方 0.08–2.20 m；地面和楼顶保留';
+}
+
+function eraseSelectionWorldRegion(selection) {
+  if (!selection || !libraryPreviewData || !libraryPreviewData.map) return null;
+  const meta=libraryPreviewData.map;
+  const rect=libraryImageRect();
+  if (!rect || rect.width<=0 || rect.height<=0) return null;
+  const normalized=selection.normalized ? selection : normalizeEraseSelection(selection);
+  if (!normalized||normalized.points.length<3) return null;
+  // points_to_png is north-up: image row 0 corresponds to maximum map y.
+  return {points:normalized.points.map(point=>[
+    meta.ox+point.u*meta.w*meta.res,
+    meta.oy+(meta.h-point.v*meta.h)*meta.res,
+  ])};
+}
+
+function pointInsideErasePolygon(x,y,vertices) {
+  let inside=false;
+  for(let i=0,j=vertices.length-1;i<vertices.length;j=i++){
+    const xi=vertices[i][0],yi=vertices[i][1],xj=vertices[j][0],yj=vertices[j][1];
+    const crosses=(yi>y)!==(yj>y);
+    const edgeX=(xj-xi)*(y-yi)/(yj-yi+1e-15)+xi;
+    if(crosses&&x<edgeX)inside=!inside;
+  }
+  return inside;
+}
+
+function applyLibraryErasePreview() {
+  if (!libraryPreviewData || !Array.isArray(libraryPreviewData.map3d)) return;
+  const source=libraryPreviewData.map3d;
+  const regions=libraryEraseSelections.map(eraseSelectionWorldRegion).filter(Boolean);
+  const sourceCount=(source.length/3)|0;
+  if (!regions.length) {
+    setLibraryCloud(source,false);
+    $('library3dHint').textContent=`${sourceCount} 个预览点 · 左键旋转 · 中键平移 · 滚轮缩放`;
+    $('libraryMeta').textContent=`${libraryPreviewData.name} · 原始 ${libraryPreviewData.point_count} 点 · 地面高度 ${libraryPreviewData.floor_z} m`;
+    $('libraryEraseNote').textContent=`擦除高度 ${libraryPreviewData.erase_height_range[0].toFixed(2)}–${libraryPreviewData.erase_height_range[1].toFixed(2)} m；当前未修改`;
+    return;
+  }
+  const range=libraryPreviewData.erase_height_range || [.08,2.2];
+  const filtered=[];
+  let removed=0;
+  for(let i=0;i<source.length;i+=3){
+    const x=source[i],y=source[i+1],z=source[i+2];
+    let erase=false;
+    if(z>=range[0]&&z<=range[1]){
+      for(const region of regions){
+        if(pointInsideErasePolygon(x,y,region.points)){erase=true;break;}
+      }
+    }
+    if(erase)removed++;
+    else filtered.push(x,y,z);
+  }
+  setLibraryCloud(filtered,false);
+  $('library3dHint').textContent=`预览 ${sourceCount-removed} / ${sourceCount} 点 · 临时隐藏 ${removed} 点 · 中键平移 · 尚未保存`;
+  $('libraryMeta').textContent=`${libraryPreviewData.name} · 2D/3D 擦除预览已生效 · 原地图未修改`;
+  $('libraryEraseNote').textContent=`预览中：${regions.length} 个区域，3D 隐藏 ${removed} 个采样点；撤销可恢复，统一另存后才写入`;
+}
+
+function suggestedCleanMapName(name) {
+  const stem=(name||'map').replace(/\.npz$/i,'');
+  const now=new Date(), pad=n=>String(n).padStart(2,'0');
+  return `${stem}_clean_${pad(now.getHours())}${pad(now.getMinutes())}.npz`;
+}
+
+async function saveErasedMap() {
+  const regions=libraryEraseSelections.map(eraseSelectionWorldRegion).filter(Boolean);
+  if (!regions.length) { toast('请先在 2D 地图上手绘需要擦除的区域',true); return; }
+  const area=regions.reduce((sum,region)=>sum+polygonArea(region.points.map(point=>({x:point[0],y:point[1]}))),0);
+  let outputName=window.prompt(
+    `将只擦除手绘区域内地面上方 0.08–2.20 m 的点，地面与楼顶保留。\n原图不会覆盖，请输入新地图名：`,
+    suggestedCleanMapName(libraryCurrentName));
+  if (outputName===null) return;
+  outputName=outputName.trim();
+  if (!outputName) { toast('新地图名不能为空',true); return; }
+  if (!window.confirm(
+      `确认另存“${outputName}”？\n共 ${regions.length} 个不规则区域，总面积 ${area.toFixed(2)} m²；楼顶和地面受高度保护。`)) return;
+  const button=$('btnEraseSave'); button.disabled=true; button.textContent='处理中…';
+  try {
+    const response=await fetch('/api/maps/erase',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:libraryCurrentName,output_name:outputName,regions}),
+    });
+    const result=await response.json();
+    toast((result.success?'✓ ':'✗ ')+result.message,!result.success);
+    if (!result.success) throw new Error(result.message);
+    clearEraseSelection(true);
+    await refreshMapLibrary();
+    await openMapPreview(result.name);
+  } catch(error) {
+    if (!String(error).includes('擦除失败')) toast('擦除失败: '+error,true);
+  } finally {
+    button.textContent='统一另存';
+    button.disabled=!libraryEraseSelections.length;
+  }
+}
+
+function renderLibrary2D() {
+  const stage=$('library2dStage'), image=$('library2dImage');
+  if (!stage || !image.naturalWidth) return;
+  const base=Math.min(stage.clientWidth/image.naturalWidth,stage.clientHeight/image.naturalHeight);
+  const scale=base*library2dView.zoom;
+  const width=image.naturalWidth*scale, height=image.naturalHeight*scale;
+  image.style.width=width+'px'; image.style.height=height+'px';
+  image.style.left=((stage.clientWidth-width)/2+library2dView.panX)+'px';
+  image.style.top=((stage.clientHeight-height)/2+library2dView.panY)+'px';
+  $('library2dHint').textContent=libraryEraseMode ?
+    `${Math.round(library2dView.zoom*100)}% · 左键手绘 · 中键拖动 · 滚轮缩放` :
+    `${Math.round(library2dView.zoom*100)}% · 滚轮缩放 · 左键/中键拖动 · 双击复位`;
+  renderEraseBoxes();
+}
+
+async function openMapPreview(name) {
+  libraryCurrentName=name;
+  libraryPreviewData=null;
+  clearEraseSelection(true);
+  $('btnEraseMode').disabled=true;
+  $('library3dHint').textContent='正在加载…';
+  $('libraryMeta').textContent='正在加载 '+name;
+  try {
+    const r=await fetch('/api/maps/preview?name='+encodeURIComponent(name));
+    const data=await r.json();
+    if (!r.ok || !data.success) throw new Error(data.message || 'HTTP '+r.status);
+    initLibrary3D();
+    libraryPreviewData=data;
+    setLibraryCloud(data.map3d || []);
+    $('library3dEmpty').classList.add('hidden');
+    $('library2dEmpty').classList.add('hidden');
+    $('library3dHint').textContent=`${data.preview_point_count} 个预览点 · 左键旋转 · 中键平移 · 滚轮缩放`;
+    $('libraryMeta').textContent=`${data.name} · 原始 ${data.point_count} 点 · 地面高度 ${data.floor_z} m`;
+    $('btnEraseMode').disabled=false;
+    $('libraryEraseNote').textContent=`擦除高度 ${data.erase_height_range[0].toFixed(2)}–${data.erase_height_range[1].toFixed(2)} m；地面和楼顶保留`;
+    const image=$('library2dImage');
+    image.onload=()=>{ image.style.display='block'; resetLibrary2D(); };
+    image.src=data.map_png;
+    renderMapLibraryRows();
+  } catch(error) {
+    toast('地图预览失败: '+error,true);
+    $('library3dHint').textContent='加载失败';
+  }
+}
+
+let libraryMaps=[];
+function renderMapLibraryRows() {
+  const list=$('mapLibraryList');
+  list.replaceChildren();
+  if (!libraryMaps.length) {
+    const empty=document.createElement('div'); empty.className='map-empty'; empty.textContent='暂无地图'; list.appendChild(empty); return;
+  }
+  libraryMaps.forEach(item => {
+    const row=document.createElement('div'); row.className='map-row'+(item.name===libraryCurrentName?' active':'');
+    const name=document.createElement('span'); name.className='map-name'; name.textContent=item.name; name.title=item.name;
+    const actions=document.createElement('div'); actions.className='map-actions';
+    const open=document.createElement('button'); open.textContent='打开'; open.onclick=()=>openMapPreview(item.name);
+    const baseline=document.createElement('button');
+    baseline.textContent=item.active_navigation?'当前基准':'设为基准';
+    baseline.className=item.active_navigation?'primary':'';
+    baseline.disabled=!!item.active_navigation;
+    baseline.onclick=()=>setNavigationBaseline(item.name);
+    const download=document.createElement('button'); download.textContent='下载'; download.onclick=()=>downloadMap(item.name);
+    const remove=document.createElement('button'); remove.textContent=item.protected?'受保护':'删除'; remove.className='danger';
+    remove.disabled=!!item.protected; remove.onclick=()=>deleteMap(item.name);
+    actions.append(open,baseline,download,remove); row.append(name,actions); list.appendChild(row);
+  });
+}
+
+async function setNavigationBaseline(name) {
+  if (!window.confirm(
+      `确认将“${name}”设为导航基准？\n系统会停止使用旧静态图并重建导航栅格和障碍点云，期间不会启动机器狗。`)) return;
+  toast('正在重建导航基准，请稍候…');
+  try {
+    const response=await fetch('/api/maps/navigation-baseline',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name}),
+    });
+    const result=await response.json();
+    toast((result.success?'✓ ':'✗ ')+result.message,!result.success);
+    if(!result.success)return;
+    invalidateNavigationMap();
+    await refreshMapLibrary();
+    if(libraryCurrentName===name)renderMapLibraryRows();
+  } catch(error) { toast('切换导航基准失败: '+error,true); }
+}
+
+async function refreshMapLibrary() {
+  $('mapCount').textContent='加载中…';
+  try {
+    const r=await fetch('/api/maps'), data=await r.json();
+    libraryMaps=data.maps || [];
+    $('mapCount').textContent=`${libraryMaps.length} 张`;
+    renderMapLibraryRows();
+  } catch(error) {
+    $('mapCount').textContent='加载失败';
+    const list=$('mapLibraryList'); list.textContent='地图列表加载失败：'+error;
+    toast('地图列表加载失败: '+error,true);
+  }
+}
+
+async function addMap(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.npz')) { toast('只支持 .npz 地图文件',true); return; }
+  const form=new FormData(); form.append('file',file,file.name);
+  try {
+    const r=await fetch('/api/maps',{method:'POST',body:form}), data=await r.json();
+    toast((data.success?'✓ ':'✗ ')+data.message,!data.success);
+    if (data.success) { await refreshMapLibrary(); openMapPreview(data.name); }
+  } catch(error) { toast('添加地图失败: '+error,true); }
+  $('mapUploadInput').value='';
+}
+
+async function deleteMap(name) {
+  if (!window.confirm(`确认删除地图“${name}”？删除后无法恢复。`)) return;
+  try {
+    const r=await fetch('/api/maps/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+    const data=await r.json(); toast((data.success?'✓ ':'✗ ')+data.message,!data.success);
+    if (data.success) {
+      if (libraryCurrentName===name) {
+        libraryCurrentName=null; libraryPreviewData=null; clearEraseSelection(true);
+        $('btnEraseMode').disabled=true; $('libraryMeta').textContent='未打开地图';
+      }
+      refreshMapLibrary();
+    }
+  } catch(error) { toast('删除地图失败: '+error,true); }
+}
+
+async function downloadMap(name) {
+  try {
+    const r=await fetch('/api/download?name='+encodeURIComponent(name));
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const blob=await r.blob(), a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download=name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  } catch(error) { toast('下载失败: '+error,true); }
+}
+
+const libraryPointers=new Map();
+$('library2dStage').addEventListener('wheel',ev=>{
+  ev.preventDefault();
+  const stage=ev.currentTarget,image=$('library2dImage');
+  if(!image.naturalWidth)return;
+  const rect=stage.getBoundingClientRect();
+  const cursorX=ev.clientX-rect.left,cursorY=ev.clientY-rect.top;
+  const oldRect=libraryImageRect();
+  const u=oldRect&&oldRect.width>0?(cursorX-oldRect.left)/oldRect.width:.5;
+  const v=oldRect&&oldRect.height>0?(cursorY-oldRect.top)/oldRect.height:.5;
+  const nextZoom=Math.max(.2,Math.min(20,library2dView.zoom*Math.exp(-ev.deltaY*.0015)));
+  if(nextZoom===library2dView.zoom)return;
+  library2dView.zoom=nextZoom;
+  const base=Math.min(stage.clientWidth/image.naturalWidth,stage.clientHeight/image.naturalHeight);
+  const nextWidth=image.naturalWidth*base*nextZoom,nextHeight=image.naturalHeight*base*nextZoom;
+  library2dView.panX=cursorX-u*nextWidth-(stage.clientWidth-nextWidth)/2;
+  library2dView.panY=cursorY-v*nextHeight-(stage.clientHeight-nextHeight)/2;
+  renderLibrary2D();
+},{passive:false});
+$('library2dStage').addEventListener('pointerdown',ev=>{
+  if(ev.button===1){
+    ev.preventDefault();
+    libraryPointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+    ev.currentTarget.setPointerCapture(ev.pointerId);
+    ev.currentTarget.classList.add('dragging');
+    return;
+  }
+  if(ev.button!==0)return;
+  if (libraryEraseMode) {
+    const rect=ev.currentTarget.getBoundingClientRect();
+    const point={x:ev.clientX-rect.left,y:ev.clientY-rect.top};
+    libraryEraseDrag={pointerId:ev.pointerId,...point};
+    libraryEraseDraft={points:[point]};
+    ev.currentTarget.setPointerCapture(ev.pointerId); renderEraseBoxes(); return;
+  }
+  libraryPointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+  ev.currentTarget.setPointerCapture(ev.pointerId); ev.currentTarget.classList.add('dragging');
+});
+$('library2dStage').addEventListener('auxclick',ev=>{if(ev.button===1)ev.preventDefault();});
+$('library2dStage').addEventListener('pointermove',ev=>{
+  if (libraryEraseDrag && libraryEraseDrag.pointerId===ev.pointerId) {
+    const rect=ev.currentTarget.getBoundingClientRect();
+    const point={x:ev.clientX-rect.left,y:ev.clientY-rect.top};
+    const last=libraryEraseDraft.points[libraryEraseDraft.points.length-1];
+    if(Math.hypot(point.x-last.x,point.y-last.y)>=3&&libraryEraseDraft.points.length<500)libraryEraseDraft.points.push(point);
+    renderEraseBoxes(); return;
+  }
+  const old=libraryPointers.get(ev.pointerId); if(!old)return;
+  library2dView.panX+=ev.clientX-old.x; library2dView.panY+=ev.clientY-old.y;
+  libraryPointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY}); renderLibrary2D();
+});
+function endLibraryPointer(ev){
+  if (libraryEraseDrag && libraryEraseDrag.pointerId===ev.pointerId) {
+    libraryEraseDrag=null;
+    const normalized=normalizeEraseSelection(libraryEraseDraft);
+    const region=eraseSelectionWorldRegion(normalized);
+    const area=region?polygonArea(region.points.map(point=>({x:point[0],y:point[1]}))):0;
+    if (!normalized || normalized.points.length<3 || area<.0025) {
+      libraryEraseDraft=null;
+      toast('不规则区域太小，请按住鼠标沿轮廓完整绘制',true);
+    } else {
+      libraryEraseSelections.push(normalized); libraryEraseDraft=null;
+      $('btnEraseUndo').disabled=!libraryEraseSelections.length;
+      $('btnEraseCancel').disabled=!libraryEraseSelections.length;
+      $('btnEraseSave').disabled=!libraryEraseSelections.length;
+      applyLibraryErasePreview();
+    }
+    renderEraseBoxes(); return;
+  }
+  libraryPointers.delete(ev.pointerId);
+  if(!libraryPointers.size)$('library2dStage').classList.remove('dragging');
+}
+$('library2dStage').addEventListener('pointerup',endLibraryPointer);
+$('library2dStage').addEventListener('pointercancel',endLibraryPointer);
+$('library2dStage').addEventListener('dblclick',ev=>{if(!libraryEraseMode)resetLibrary2D();});
+
+
+// ---------- WebSocket ----------
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    $('bdConn').innerHTML = '<span class="dot"></span>已连接';
+    $('bdConn').className = 'badge on';
+  };
+  ws.onmessage = e => {
+    const incoming = JSON.parse(e.data);
+    if (incoming.mode && incoming.mode !== activeMode) showMode(incoming.mode);
+    renderGlobalControls(incoming.chassis || (incoming.health || {}).chassis || {});
+    if (incoming.mode === 'maps') {
+      $('bdEngine').innerHTML = '<span class="dot"></span>引擎: 离线预览';
+      $('bdEngine').className = 'badge';
+      $('bdMap').innerHTML = `<span class="dot"></span>地图: ${libraryMaps.length} 张`;
+      $('bdMap').className = 'badge on';
+      $('bdMapping').innerHTML = '<span class="dot"></span>建图/导航: 已停止';
+      $('bdMapping').className = 'badge';
+      return;
+    }
+    if (incoming.mode === 'navigation') {
+      renderNavigation(incoming);
+      return;
+    }
+    frame = incoming;
+    if (frame.pose && frame.health && frame.health.pose_valid) {
+      const last = trail.length ? trail[trail.length - 1] : null;
+      if (!last || Math.hypot(frame.pose.x - last.x, frame.pose.y - last.y) > 0.01) {
+        trail.push({ x: frame.pose.x, y: frame.pose.y });
+        if (trail.length > 600) trail.shift();
+      }
+    }
+    // 3D 数据：1Hz 全量推送时更新粒子
+    if (frame.map3d && frame.map3d.length) {
+      mapPts = frame.map3d;
+      updateParticles3D();
+      $('st3D').textContent =
+        `粒子 ${(mapPts.length / 3) | 0} 个 · 左键旋转 · 中键平移 · 滚轮缩放`;
+    }
+    drawMap();
+    drawLidar();
+    if (frame.lidar3d && frame.lidar3d.length) {
+      lidarLivePts = frame.lidar3d;
+      updateLidarLive3D();
+    }
+    updateRobot3D();
+    updateTrail3D();
+    renderStatus();
+  };
+  ws.onclose = () => {
+    stopTeleopTransmit();
+    $('teleopToggle').checked = false;
+    $('bdConn').innerHTML = '<span class="dot"></span>已断开，重连中…';
+    $('bdConn').className = 'badge offline';
+    clearTimeout(wsTimer);
+    wsTimer = setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ---------- 初始化 ----------
+$('btnSave').addEventListener('click', saveMap);
+$('btnMappingStart').addEventListener('click', () => mappingAction('start'));
+$('btnMappingStop').addEventListener('click', () => mappingAction('stop'));
+$('btnPlan').addEventListener('click', planGoal);
+$('btnCancelNavigation').addEventListener('click', cancelNavigation);
+$('btnChassisEnable').addEventListener('click', toggleChassis);
+$('teleopToggle').addEventListener('change', () => toggleTeleop());
+$('btnStandDown').addEventListener('click', () => requestPosture('stand_down'));
+$('btnRecoveryStand').addEventListener('click', () => requestPosture('recovery_stand'));
+$('btnPreviewPlan').addEventListener('click', previewPlan);
+$('btnPickPreviewStart').addEventListener('click', togglePreviewStartPick);
+$('btnPickAlignment').addEventListener('click', toggleAlignmentPick);
+$('btnSaveAlignment').addEventListener('click', saveAlignment);
+$('alignmentYaw').addEventListener('input', () => setAlignmentMarker(
+  Number($('alignmentX').value), Number($('alignmentY').value), Number($('alignmentYaw').value)));
+$('btnClearPreview').addEventListener('click', () => clearNavigationPreview(true));
+$('tabMapping').addEventListener('click', () => requestMode('mapping'));
+$('tabNavigation').addEventListener('click', () => requestMode('navigation'));
+$('tabMaps').addEventListener('click', () => requestMode('maps'));
+$('btnAddMap').addEventListener('click', () => $('mapUploadInput').click());
+$('btnRefreshMaps').addEventListener('click', refreshMapLibrary);
+$('btnEraseMode').addEventListener('click', toggleEraseMode);
+$('btnEraseUndo').addEventListener('click', () => {
+  libraryEraseSelections.pop();
+  $('btnEraseUndo').disabled=!libraryEraseSelections.length;
+  $('btnEraseCancel').disabled=!libraryEraseSelections.length;
+  $('btnEraseSave').disabled=!libraryEraseSelections.length;
+  applyLibraryErasePreview();
+  renderEraseBoxes();
+});
+$('btnEraseCancel').addEventListener('click', () => clearEraseSelection(true));
+$('btnEraseSave').addEventListener('click', saveErasedMap);
+$('mapUploadInput').addEventListener('change', ev => addMap(ev.target.files[0]));
+window.addEventListener('load', () => {
+  fitCanvas(mapCanvas);
+  fitCanvas(lidarCanvas);
+  showMode(document.body.dataset.initialMode || 'mapping');
+  init3D();
+  fetch('/api/mode').then(r => r.json()).then(data => showMode(data.mode, data)).catch(() => {});
+  connectWS();
+});
+</script>
+</body>
+</html>
