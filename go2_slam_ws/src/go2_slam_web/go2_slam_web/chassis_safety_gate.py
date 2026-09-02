@@ -44,6 +44,21 @@ def clamp(value, limit):
     return max(-limit, min(limit, float(value)))
 
 
+def planner_command_ready(command_t, command_epoch_t):
+    """Accept only commands produced after the current control epoch."""
+    return (command_t is not None and command_epoch_t is not None and
+            command_t >= command_epoch_t)
+
+
+def planner_command_start_timed_out(command_t, command_epoch_t, now, timeout):
+    """Report a missing first command after a bounded zero-speed grace."""
+    if planner_command_ready(command_t, command_epoch_t):
+        return False
+    if command_epoch_t is None:
+        return True
+    return now - command_epoch_t > max(0.0, float(timeout))
+
+
 class ChassisSafetyGate(Node):
     """Gate planner commands behind arming, watchdogs and velocity limits."""
 
@@ -68,6 +83,12 @@ class ChassisSafetyGate(Node):
         self.emergency_stop_timeout = float(
             self.declare_parameter('emergency_stop_timeout', 0.20).value)
         self.cmd_timeout = float(self.declare_parameter('cmd_timeout', 0.30).value)
+        # Nav2 intentionally emits no velocity while it has no active goal.
+        # Start this grace period when Web releases cancellation for a fresh
+        # goal, not when the operator arms the otherwise idle chassis.
+        self.initial_cmd_timeout = max(
+            self.cmd_timeout,
+            float(self.declare_parameter('initial_cmd_timeout', 3.0).value))
         self.teleop_timeout = float(self.declare_parameter('teleop_timeout', 0.35).value)
         self.odom_timeout = float(self.declare_parameter('odom_timeout', 0.75).value)
         self.lowstate_timeout = float(self.declare_parameter('lowstate_timeout', 1.00).value)
@@ -164,6 +185,7 @@ class ChassisSafetyGate(Node):
         self.roll = 0.0
         self.pitch = 0.0
         self.armed_t = None
+        self.navigation_started_t = None
         self.last_tick_t = time.monotonic()
         self.stop_burst = 0
         self.cancel_seq = 0
@@ -236,6 +258,7 @@ class ChassisSafetyGate(Node):
             'nav2': (0.0, 0.0, 0.0),
         }
         self.planner_cmd_times = {'scan': None, 'nav2': None}
+        self.navigation_started_t = None
         self.recovery_active = False
         self.recovery_cmd = (0.0, 0.0, 0.0)
         self.recovery_cmd_t = None
@@ -448,6 +471,7 @@ class ChassisSafetyGate(Node):
         self.armed = True
         self.ever_armed = True
         self.armed_t = time.monotonic()
+        self.navigation_started_t = None
         self.output = (0.0, 0.0, 0.0)
         if self.teleop_enabled:
             self.reason = '键盘控制已启用，等待按键'
@@ -469,6 +493,7 @@ class ChassisSafetyGate(Node):
     def on_cancel(self, msg):
         self.cancelled = bool(msg.data)
         if self.cancelled:
+            self.navigation_started_t = None
             self.teleop_enabled = False
             self.teleop_cmd = (0.0, 0.0, 0.0)
             self.teleop_cmd_t = None
@@ -478,6 +503,16 @@ class ChassisSafetyGate(Node):
             self.local_waiting = False
             self.cancel_seq += 1
             self.disarm('导航取消，底盘已锁定', send_stop=True)
+            return
+        # Web publishes cancel=False immediately before each fresh goal.  A
+        # planner command from before this edge must never move the robot, and
+        # Nav2 needs a bounded interval to accept the action, build its local
+        # rollout and publish the first safe velocity.
+        self.navigation_started_t = time.monotonic()
+        self.output = (0.0, 0.0, 0.0)
+        if self.armed and not self.teleop_enabled:
+            self.reason = '已收到新目标，等待%s首条指令' % (
+                self.navigation_backend.upper())
 
     def on_posture_command(self, msg):
         """Queue a one-shot posture action behind an unconditional stop burst."""
@@ -502,6 +537,7 @@ class ChassisSafetyGate(Node):
         # A posture action is an exclusive physical operation.  Invalidate
         # both navigation and teleop before the action can reach Sport API.
         self.cancelled = True
+        self.navigation_started_t = None
         self.teleop_enabled = False
         self.planner_cmds = {
             'scan': (0.0, 0.0, 0.0),
@@ -548,6 +584,7 @@ class ChassisSafetyGate(Node):
         was_armed = self.armed
         self.armed = False
         self.armed_t = None
+        self.navigation_started_t = None
         self.output = (0.0, 0.0, 0.0)
         self.reason = reason
         if send_stop and (was_armed or self.ever_armed):
@@ -558,6 +595,7 @@ class ChassisSafetyGate(Node):
 
     def trip(self, reason):
         self.cancelled = True
+        self.navigation_started_t = None
         self.teleop_enabled = False
         self.teleop_cmd = (0.0, 0.0, 0.0)
         self.teleop_cmd_t = None
@@ -823,6 +861,8 @@ class ChassisSafetyGate(Node):
             selected_timeout = self.teleop_timeout
             missing_reason = '启用后未收到键盘控制指令'
             stale_reason = '键盘控制指令超时'
+            command_epoch_t = self.armed_t
+            initial_timeout = 1.0
         else:
             if self.cancelled:
                 return
@@ -845,8 +885,15 @@ class ChassisSafetyGate(Node):
                     self.navigation_backend.upper())
                 stale_reason = '%s速度指令超时' % (
                     self.navigation_backend.upper())
-        if selected_cmd_t is None or selected_cmd_t < self.armed_t:
-            if now - self.armed_t > 1.0:
+            command_epoch_t = max(
+                stamp for stamp in
+                (self.armed_t, self.navigation_started_t)
+                if stamp is not None)
+            initial_timeout = self.initial_cmd_timeout
+        if not planner_command_ready(selected_cmd_t, command_epoch_t):
+            self.output = (0.0, 0.0, 0.0)
+            if planner_command_start_timed_out(
+                    selected_cmd_t, command_epoch_t, now, initial_timeout):
                 self.trip(missing_reason)
             return
         if now - selected_cmd_t > selected_timeout:
@@ -942,6 +989,9 @@ class ChassisSafetyGate(Node):
             'lowstate_age': None if self.lowstate_t is None else round(now - self.lowstate_t, 3),
             'heartbeat_age': None if self.heartbeat_t is None else round(now - self.heartbeat_t, 3),
             'alignment_valid': self.alignment_valid,
+            'navigation_start_age': (
+                None if self.navigation_started_t is None else
+                round(now - self.navigation_started_t, 3)),
             'output': [round(value, 3) for value in self.output],
             'limits': [self.max_vx, self.max_vy, self.max_vyaw],
             'teleop_limits': [self.teleop_max_vx, self.max_vy, self.max_vyaw],
