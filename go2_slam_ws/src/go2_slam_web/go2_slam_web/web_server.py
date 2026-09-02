@@ -607,7 +607,7 @@ class WebNode(Node):
         self.chassis_status = {
             'connected': False, 'enabled': False, 'ready': False,
             'teleop_enabled': False, 'control_mode': 'navigation',
-            'navigation_backend': 'nav2',
+            'navigation_backend': 'scan',
             'reason': '等待底盘安全门',
         }
         self.chassis_status_t = 0.0
@@ -620,7 +620,7 @@ class WebNode(Node):
             Bool, '/go2/nav2/navigation_completed',
             self.on_nav2_navigation_completed, 10)
         self.nav2_status = {
-            'state': 'offline', 'message': 'Nav2 导航服务未连接'}
+            'state': 'offline', 'message': 'Nav2 影子服务未连接'}
         self.nav2_status_t = 0.0
         self.nav2_shadow_metrics = {}
         self.create_subscription(
@@ -1003,10 +1003,10 @@ class WebNode(Node):
             pass
 
     def complete_navigation(self, source):
-        selected = self.chassis_status.get('navigation_backend', 'nav2')
+        selected = self.chassis_status.get('navigation_backend', 'scan')
         if selected != source:
             self.get_logger().info(
-                'Ignored %s completion; selected backend is %s' %
+                'Ignored %s shadow completion; selected backend is %s' %
                 (source.upper(), selected.upper()))
             return
         # The selected controller is the source of truth for completion. Clear
@@ -1366,23 +1366,18 @@ class ApiNavigationGoalHandler(tornado.web.RequestHandler):
         if ok:
             self.application.camera.start()
             issued_at = time.time()
-            backend = str(chassis.get('navigation_backend', 'nav2'))
             self.application.web_node.publish_navigation_cancel(False)
+            self.application.web_node.publish_global_path(points)
             adjusted_goal = self.application.navigation.goal
-            if backend == 'scan':
-                # Legacy standalone mode. In the normal hybrid deployment the
-                # Nav2 Controller plugin is the only publisher of SCAN's
-                # reference path, preventing two global-path generations from
-                # racing on the same topic.
-                self.application.web_node.publish_global_path(points)
-            elif adjusted_goal is not None:
+            if adjusted_goal is not None:
                 self.application.web_node.publish_nav2_goal(
                     adjusted_goal['x'], adjusted_goal['y'])
-            # A fresh nonzero safe command confirms that Nav2, the SCAN local
-            # trajectory adapter and the safety filters have all responded.
-            # A zero result can also be a legitimate local wait, so keep the
-            # accepted target and let Nav2's bounded recovery policy decide.
+            # A blocked live lidar grid is a persistent wait state, not a
+            # terminal navigation failure.  Keep the global target and chassis
+            # ownership; SCAN publishes a zero-speed hold and retries locally
+            # until the obstacle clears or the operator explicitly cancels.
             command_ready = False
+            backend = str(chassis.get('navigation_backend', 'scan'))
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 command = self.application.web_node.planner_commands.get(
@@ -1463,7 +1458,7 @@ class ApiNavigationBackendHandler(tornado.web.RequestHandler):
     def get(self):
         chassis = self.application.web_node.chassis_status
         self.write(json.dumps({
-            'backend': chassis.get('navigation_backend', 'nav2'),
+            'backend': chassis.get('navigation_backend', 'scan'),
             'chassis_enabled': bool(chassis.get('enabled')),
             'nav2_online': (
                 time.monotonic() - self.application.web_node.nav2_status_t < 1.5),

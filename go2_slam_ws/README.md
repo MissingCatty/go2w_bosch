@@ -8,10 +8,9 @@ VLM 已适配本机 Qwen3.5-2B Q8_0 + Q8 视觉投影器 + llama.cpp CUDA 服务
 默认仍关闭；硬件部署、配置和安全边界见
 [`REMEMBR_EDGE_INTEGRATION.md`](REMEMBR_EDGE_INTEGRATION.md)。
 
-导航侧使用 Humble Nav2 统一管理：Smac State Lattice 负责全局规划，
-SCAN-Planner 只生成实时局部 B-spline，Nav2 Controller 插件负责跟踪，之后接
-速度平滑、Collision Monitor 和有界恢复行为树。底盘仍经过默认锁定的独立安全门；
-架构、参数与验收见 [`NAV2_GO2W_INTEGRATION.md`](NAV2_GO2W_INTEGRATION.md)。
+默认导航使用 Web A* 全局路径、SCAN-Planner 局部 B 样条以及项目自研的闭环
+控制和实时脱困节点。实验性的 Nav2 影子链保留在源码中供离线对比，但不会由
+`start_navigation.sh` 构建或启动。
 
 ## 当前数据链路
 
@@ -51,10 +50,10 @@ cd ~/go2_slam_ws
 # 重启后一键拉起完整导航链路（含 SCAN，音量设为 10%，底盘保持锁定）
 ./start_navigation.sh
 
-# 同时重编所有导航组件
+# 同时重编主机、LIO-SAM、SCAN 和 VLM 组件
 ./start_navigation.sh --build
 
-# 单独管理 Nav2 + SCAN 局部轨迹链（启动后底盘仍保持锁定）
+# 可选实验：单独管理 Nav2 影子链（默认不启动、不接管底盘）
 ./build_nav2.sh
 ./start_nav2_shadow.sh
 ./stop_nav2_shadow.sh

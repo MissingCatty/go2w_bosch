@@ -96,9 +96,9 @@ class ChassisSafetyGate(Node):
         self.max_tilt = float(self.declare_parameter('max_tilt', 0.55).value)
 
         default_backend = str(
-            self.declare_parameter('navigation_backend', 'nav2').value).lower()
+            self.declare_parameter('navigation_backend', 'scan').value).lower()
         self.navigation_backend = (
-            default_backend if default_backend in ('scan', 'nav2') else 'nav2')
+            default_backend if default_backend in ('scan', 'nav2') else 'scan')
         self.backend_switch_error = ''
 
         self.request_pub = self.create_publisher(Request, '/api/sport/request', 10)

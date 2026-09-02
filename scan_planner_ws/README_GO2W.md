@@ -1,77 +1,84 @@
 # SCAN-Planner × GO2-W
 
-这个工作区提供 SCAN-Planner 的 ROS 2 Humble 移植和 GO2-W/LIO-SAM
-适配。当前默认以 `planner_only:=true` 运行：SCAN 只生成局部无碰 B 样条，
-不再直接控制底盘，也不再启动旧版闭环控制器和独立脱困节点。
+This workspace contains the ROS 2 community port of SCAN-Planner plus a
+GO2-W/LIO-SAM adapter.  The controller always publishes the isolated topic
+`/scan_planner/cmd_vel_test`.  A separate host-side safety gate may forward it
+to the Unitree Sport API only after explicit arming in the Web UI.
 
-## 当前导航链路
-
-```text
-LIO-SAM odom + 当前点云
-  -> Nav2 Smac 生成全局路径
-  -> go2_scan_nav2_controller 把全局路径送给 SCAN
-  -> SCAN 实时三维占据 + 局部 B 样条
-  -> Nav2 controller_server 跟踪 B 样条
-  -> Nav2 velocity_smoother
-  -> Nav2 collision_monitor
-  -> go2_chassis_safety_gate（默认锁定）
-  -> Unitree Sport API
-```
-
-Nav2 负责目标生命周期、全局规划、进度判断、行为树恢复、速度平滑和碰撞
-监控；SCAN 只负责当前激光视野内的局部轨迹生成。SCAN 输出的原生消息是
-`/scan_planner/planning/bspline`，由 Nav2 控制器插件消费。
-
-## 输入与坐标系
+## Data path
 
 ```text
-/lio_sam/mapping/odometry
+/lio_sam/mapping/odometry (lidar pose)
   -> lio_pose_adapter
      -> /scan_planner/sensor_pose
-     -> /scan_planner/body_pose
+     -> /scan_planner/body_pose (base_link pose)
 
 /lio_sam/deskew/cloud_deskewed + poses
-  -> SCAN 实时三维局部占据
+  -> SCAN local 3D occupancy grid
 
-Nav2 Smac path
-  -> /scan_planner/global_path
-  -> SCAN local B-spline
+saved map_*.npz
+  -> prepare_navigation_map.py (level / evidence filter / height slice / inflate)
+     -> Web A* global reference path
+
+/lio_sam/deskew/cloud_deskewed + poses
+  -> SCAN live 3D occupancy only
+
+SCAN local 3D occupancy grid
+  -> collision-aware B-spline
+  -> closed-loop controller + tracking-progress watchdog
+  -> /scan_planner/cmd_vel_test (isolated)
+  -> go2_chassis_safety_gate (locked by default)
+  -> /api/sport/request (only while explicitly armed and healthy)
+
+Web “取消导航” -> /scan_planner/cancel
+  -> FSM waits for a new target + controller publishes zero velocity
+  -> physical chassis gate locks and sends a stop burst
 ```
 
-适配器应用已标定的 `base_link -> rslidar` 变换
-`(0.1701, 0, 0.0908, yaw=+90deg)`。`world_z_offset=0.53m` 用于将
-LIO 启动原点与保存地图的地面高度对齐，可在
-`src/go2_scan_planner_bridge/config/go2w.yaml` 中配置。
+The adapter applies the calibrated `base_link -> rslidar` transform
+`(0.1701, 0, 0.0908, yaw=+90deg)`.  `world_z_offset=0.53m` aligns the LIO
+startup origin with the floor measured in the saved map; it is configurable in
+`src/go2_scan_planner_bridge/config/go2w.yaml`.
 
-保存地图的 `map -> odom` 变换只有在 Web 自动定位对当前开机和当前地图验证
-通过后才会发布。静态地图供 Nav2 Smac 做全局规划；SCAN 的占据、碰撞检查和
-局部绕行只使用实时激光数据。
+The saved-map `map -> odom` transform is loaded by `go2_static_navigation_map`
+after the Web automatic registration validates it for the current boot and map.
+The static map has one navigation role: Web A* uses it to produce the global
+reference path. SCAN and the recovery node do not subscribe to the saved 3D
+cloud or static occupancy grids. Their occupancy, collision checks, detours and
+recovery primitives are validated only against current lidar data. There is no
+hard corridor around the global centreline; only a weak route-shape preference
+remains so the local planner can take a wide live detour.
 
-## 构建与启动
+The controller does not advance its reference clock blindly. A large heading
+error first enters turn-only mode with hysteresis, while moderate error is
+corrected during translation. If tracking error exceeds `0.25m`, or the robot
+passes a reference point by more than `0.20m`, that local trajectory is
+discarded immediately: output becomes zero and the FSM replans from measured
+odometry. Small along-track overshoot is never chased backwards, and normal
+path tracking clamps body-frame reverse speed to zero. Reaching the nominal
+trajectory duration away from the real target also replans instead of falsely
+reporting completion.
+
+## Commands
 
 ```bash
-cd /home/unitree/scan_planner_ws
-./build_go2w.sh
-./start_go2w_dry.sh
+cd ~/go2_slam_ws && ./start.sh
+~/go2_slam_ws/tools/prepare_navigation_map.py \
+  ~/go2_slam_ws/maps/map_20260811_155640_273.npz \
+  --clear-start-x -0.05 --clear-start-y 0.21 --clear-start-radius 0.80
+cd ~/scan_planner_ws && ./start_go2w_dry.sh
+
+# Plan one metre in the robot's current forward direction. This does not move it.
+./send_forward_test_goal.sh 1.0
+
+./stop_go2w.sh
 ```
 
-`start_go2w_dry.sh` 会显式传入 `planner_only:=true`。需要临时复现历史独立
-控制链时才可手工传入 `planner_only:=false`；正常整机导航不要这样做。
+Build from source with `./build_go2w.sh` or start with
+`./start_go2w_dry.sh --build`.
 
-完整系统从主工作区启动：
-
-```bash
-cd /home/unitree/go2_slam_ws
-./start_navigation.sh
-```
-
-## 安全边界
-
-- SCAN 的 `/scan_planner/cmd_vel_test` 在默认模式下没有发布者。
-- 只有 Nav2 的 `cmd_vel` 链能够进入主机侧底盘安全门。
-- Web 取消导航会停止 Nav2 任务、锁定安全门并发送停止脉冲。
-- 启动后必须先完成地图定位，再由操作者手工解锁真实底盘。
-- 不要把任何 SCAN 或 Nav2 中间速度话题直接接到 Sport API。
-
-控制器插件和完整边界说明见
-`/home/unitree/go2_slam_ws/NAV2_GO2W_INTEGRATION.md`。
+Do not connect `/scan_planner/cmd_vel_test` to another `/cmd_vel` or Sport API
+bridge.  The host safety gate is the only intended actuator path and includes
+explicit arming, Web heartbeat, command/odometry/LowState timeouts, tilt checks,
+velocity/acceleration limits and stop-on-cancel.  The SCAN launch itself remains
+dry-run and rejects `dry_run:=false`.

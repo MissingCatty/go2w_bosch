@@ -17,7 +17,6 @@ def _setup(context):
     bridge_share = get_package_share_directory('go2_scan_planner_bridge')
     config = os.path.join(bridge_share, 'config', 'go2w.yaml')
     dry_run = _as_bool(LaunchConfiguration('dry_run').perform(context))
-    planner_only = _as_bool(LaunchConfiguration('planner_only').perform(context))
     if not dry_run:
         raise RuntimeError(
             'Real cmd_vel output is intentionally disabled in this launch. '
@@ -46,7 +45,7 @@ def _setup(context):
         ('grid_map/sensor_pose_extrinsic', '/scan_planner/grid_map/sensor_pose_extrinsic'),
         ('self_inflation', '/scan_planner/self_inflation'),
     ]
-    nodes = [
+    return [
         Node(
             package='go2_scan_planner_bridge', executable='static_navigation_map',
             name='go2_static_navigation_map', output='screen', parameters=[config]),
@@ -60,13 +59,10 @@ def _setup(context):
             package='scan_planner', executable='scan_planner_node',
             name='scan_planner_node', output='screen', parameters=[config],
             remappings=common_remaps),
-    ]
-    if not planner_only:
-        nodes.extend([
-            Node(
-                package='scan_planner', executable='closed_loop_controller',
-                name='closed_loop_controller', output='screen', parameters=[config],
-                remappings=[
+        Node(
+            package='scan_planner', executable='closed_loop_controller',
+            name='closed_loop_controller', output='screen', parameters=[config],
+            remappings=[
                 ('body_pose', '/scan_planner/body_pose'),
                 # Emergency braking must use the newest sensor-frame XT16
                 # scan. The time-aligned local_cloud intentionally waits for
@@ -81,21 +77,17 @@ def _setup(context):
                 ('planning/emergency_stop', '/scan_planner/emergency_stop'),
                 ('navigation_cancel', '/scan_planner/cancel'),
                 ('cmd_vel', '/scan_planner/cmd_vel_test'),
-                ]),
-            Node(
-                package='go2_scan_planner_bridge', executable='realtime_recovery',
-                name='go2_realtime_recovery', output='screen', parameters=[config]),
-        ])
-    return nodes
+            ]),
+        Node(
+            package='go2_scan_planner_bridge', executable='realtime_recovery',
+            name='go2_realtime_recovery', output='screen', parameters=[config]),
+    ]
 
 
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'dry_run', default_value='true',
-            description='Must remain true; standalone output is always isolated'),
-        DeclareLaunchArgument(
-            'planner_only', default_value='true',
-            description='Run SCAN only as Nav2 local B-spline generator'),
+            description='Must remain true; output is isolated on /scan_planner/cmd_vel_test'),
         OpaqueFunction(function=_setup),
     ])

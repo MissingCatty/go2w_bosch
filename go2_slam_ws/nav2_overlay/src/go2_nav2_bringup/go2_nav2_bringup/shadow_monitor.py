@@ -30,7 +30,7 @@ class ShadowMonitor(Node):
         }
         self.output = self.create_publisher(
             String, '/go2/nav2/shadow_metrics', 10)
-        self.backend = 'nav2'
+        self.backend = 'scan'
         self.chassis_enabled = False
         self.create_subscription(
             Path, '/scan_planner/global_path',
@@ -54,7 +54,7 @@ class ShadowMonitor(Node):
             return
         if not isinstance(status, dict):
             return
-        backend = str(status.get('navigation_backend', 'nav2')).lower()
+        backend = str(status.get('navigation_backend', 'scan')).lower()
         if backend in ('scan', 'nav2'):
             self.backend = backend
         self.chassis_enabled = bool(status.get('enabled'))

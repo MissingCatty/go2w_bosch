@@ -1,9 +1,8 @@
 #!/bin/bash
-# Start Nav2 with SCAN as its local-trajectory generator. The gate stays locked.
+# Start Nav2 beside SCAN. The physical gate remains locked to SCAN by default.
 set -euo pipefail
 
 WS="$(cd "$(dirname "$0")" && pwd)"
-SCAN_WS="/home/unitree/scan_planner_ws"
 IMAGE="${GO2_NAV2_IMAGE:-go2_nav2_humble:local}"
 CONTAINER="go2_nav2_shadow"
 UNIT="go2-nav2-shadow.service"
@@ -14,10 +13,6 @@ CYCLONE_CONFIG="/home/unitree/cyclonedds_ws/cyclonedds.xml"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1 || \
    [ ! -f "$WS/nav2_overlay/install/setup.bash" ]; then
     "$WS/build_nav2.sh"
-fi
-if [ ! -f "$SCAN_WS/install/setup.bash" ]; then
-    echo "错误: SCAN-Planner 消息接口尚未构建: $SCAN_WS/install/setup.bash" >&2
-    exit 1
 fi
 if [ ! -r "$CYCLONE_CONFIG" ]; then
     echo "错误: CycloneDDS 配置不存在: $CYCLONE_CONFIG" >&2
@@ -70,11 +65,9 @@ systemd-run --user --unit="${UNIT%.service}" --collect \
       --volume="/tmp:/tmp" \
       --volume="$CYCLONE_CONFIG:/root/cyclonedds.xml:ro" \
       --volume="$WS:/root/go2_slam_ws" \
-      --volume="$SCAN_WS:/root/scan_planner_ws:ro" \
       "$IMAGE" bash -lc '
         set -e
         source /opt/ros/humble/setup.bash
-        source /root/scan_planner_ws/install/setup.bash
         source /root/go2_slam_ws/nav2_overlay/install/setup.bash
         exec ros2 launch go2_nav2_bringup go2w_nav2.launch.py
       ' >/dev/null
@@ -148,9 +141,10 @@ if $alignment_valid && ! $fully_ready; then
     exit 1
 fi
 
-echo "Nav2 服务已启动（Smac + SCAN 局部轨迹 + Nav2 跟踪/恢复/碰撞监控）"
-echo "  SCAN 职责: 仅生成局部 B-spline，不直接输出底盘速度"
-echo "  Nav2 安全速度: /go2/nav2/cmd_vel_safe"
+echo "Nav2 影子服务已启动（Smac State Lattice + MPPI + Collision Monitor）"
+echo "  物理控制后端: SCAN（未改变）"
+echo "  Nav2 安全速度: /go2/nav2/cmd_vel_safe（安全门仅采样，不转发）"
+echo "  对比指标: /go2/nav2/shadow_metrics"
 if ! $fully_ready; then
     echo "  全局状态: 等待本次开机自动定位；定位成功后自动进入 active"
 fi

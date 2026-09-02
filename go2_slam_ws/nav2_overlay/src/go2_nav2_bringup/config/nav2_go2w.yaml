@@ -37,9 +37,7 @@ planner_server:
       retrospective_penalty: 0.015
       lookup_table_size: 20.0
       cache_obstacle_heuristic: false
-      # SCAN's rolling trajectory tracker is forward/holonomic. Deliberate
-      # reverse motion remains a bounded Nav2 recovery behavior.
-      allow_reverse_expansion: false
+      allow_reverse_expansion: true
       smooth_path: false
       lattice_filepath: /opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json
 
@@ -58,47 +56,93 @@ controller_server:
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
       required_movement_radius: 0.15
-      movement_time_allowance: 12.0
+      movement_time_allowance: 8.0
     general_goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       stateful: true
-      xy_goal_tolerance: 0.30
+      xy_goal_tolerance: 0.20
       # Web goals intentionally contain no requested final heading.
       yaw_goal_tolerance: 3.14
     FollowPath:
-      # Nav2 owns the action, controller lifecycle and recovery state. SCAN is
-      # used only to turn Smac's global path into a live local B-spline.
-      plugin: go2_scan_nav2_controller/ScanTrajectoryController
-      transform_tolerance: 0.30
-      initial_plan_timeout: 2.0
-      local_waiting_timeout: 3.0
-      trajectory_refresh_timeout: 1.0
-      compute_watchdog_timeout: 0.60
-      preview_time: 0.20
-      heading_error_enter: 0.80
-      heading_error_exit: 0.35
-      yaw_deadband: 0.08
-      position_gain: 0.70
-      yaw_gain: 0.80
-      max_vx: 0.50
-      max_vy: 0.10
-      max_wz: 0.45
-      curvature_yaw_reserve: 0.08
-      curvature_deadband: 0.05
-      finish_distance: 0.15
-      goal_stop_distance: 0.15
-      goal_brake_decel: 0.45
-      goal_reaction_time: 0.15
-      tracking_replan_error: 0.50
-      replan_request_interval: 0.75
-      local_path_sample_dt: 0.10
-      global_path_topic: /scan_planner/global_path
-      trajectory_topic: /scan_planner/planning/bspline
-      local_path_topic: /scan_planner/local_path
-      local_waiting_topic: /scan_planner/planning/local_waiting
-      execution_frozen_topic: /scan_planner/planning/execution_frozen
-      controller_velocity_topic: /scan_planner/planning/controller_velocity_world
-      replan_request_topic: /scan_planner/planning/replan_request
+      plugin: nav2_mppi_controller::MPPIController
+      time_steps: 48
+      model_dt: 0.05
+      batch_size: 1000
+      vx_std: 0.18
+      vy_std: 0.0
+      wz_std: 0.35
+      vx_max: 0.50
+      vx_min: -0.20
+      vy_max: 0.0
+      wz_max: 0.45
+      iteration_count: 1
+      prune_distance: 1.7
+      transform_tolerance: 0.20
+      temperature: 0.30
+      gamma: 0.015
+      motion_model: DiffDrive
+      visualize: false
+      regenerate_noises: false
+      critics:
+        - ConstraintCritic
+        - CostCritic
+        - GoalCritic
+        - GoalAngleCritic
+        - PathAlignCritic
+        - PathFollowCritic
+        - PathAngleCritic
+        - PreferForwardCritic
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 2
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: false
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: true
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.2
+        mode: 2
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        threshold_to_consider: 0.5
 
 local_costmap:
   local_costmap:
@@ -298,18 +342,14 @@ velocity_smoother:
     use_sim_time: false
     smoothing_frequency: 20.0
     scale_velocities: false
-    # LIO reports zero until a wheel command overcomes static friction. With
-    # CLOSED_LOOP the smoother restarted from that zero every 50 ms and could
-    # never ramp beyond one 0.03-unit acceleration step. The host chassis gate
-    # still applies an independent physical acceleration/deceleration limit.
-    feedback: OPEN_LOOP
-    max_velocity: [0.50, 0.10, 0.45]
-    min_velocity: [-0.20, -0.10, -0.45]
-    max_accel: [0.60, 0.40, 0.60]
-    max_decel: [-1.50, -0.80, -1.20]
+    feedback: CLOSED_LOOP
+    max_velocity: [0.50, 0.0, 0.45]
+    min_velocity: [-0.20, 0.0, -0.45]
+    max_accel: [0.60, 0.0, 0.60]
+    max_decel: [-1.50, 0.0, -1.20]
     odom_topic: /go2/nav2/odom
     odom_duration: 0.10
-    deadband_velocity: [0.015, 0.010, 0.015]
+    deadband_velocity: [0.015, 0.0, 0.015]
     velocity_timeout: 0.30
 
 collision_monitor:

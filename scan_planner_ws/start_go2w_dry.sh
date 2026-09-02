@@ -74,8 +74,7 @@ systemd-run --user --unit="${UNIT%.service}" --collect \
     "$IMAGE" bash -lc '
       source /opt/ros/humble/setup.bash
       source /root/scan_planner_ws/install/setup.bash
-      exec ros2 launch go2_scan_planner_bridge go2w_scan_planner.launch.py \
-        dry_run:=true planner_only:=true
+      exec ros2 launch go2_scan_planner_bridge go2w_scan_planner.launch.py dry_run:=true
     ' >/dev/null
 
 for _ in $(seq 1 30); do
@@ -93,9 +92,10 @@ if ! grep -q 'body=' <<<"$logs" || \
   exit 1
 fi
 
-echo "SCAN-Planner 局部轨迹服务已启动"
-echo "  全局规划: Nav2 Smac 使用保存的静态导航图"
+echo "SCAN-Planner 干跑模式已启动"
+echo "  全局规划: Web A* 使用保存的静态导航图"
 echo "  局部规划: 仅使用实时点云（不订阅静态地图或静态栅格）"
 echo "  碰撞体: SCAN 双圆柱模型"
-echo "  控制输出: 已停用（Nav2 Controller Server 跟踪 B-spline）"
+echo "  控制输出: /scan_planner/cmd_vel_test（仅经默认锁定的安全门转发）"
+echo "  发送前方测试目标: $WS/send_forward_test_goal.sh 1.0"
 echo "  日志: $LOG"
