@@ -3,12 +3,13 @@ scan_planner_node:
     use_sim_time: false
     # Web 界面发布经过静态栅格 A* 的 nav_msgs/Path，SCAN 负责局部重规划。
     fsm.navi_mode: 3
-    # Event-triggered policy: keep executing the accepted local B-spline while
-    # its next 0.5 m is clear. Periodic candidate generation is disabled;
-    # blocked-path, tracking-recovery, new-goal and path-end events still plan.
+    # Event-triggered policy: look 1.2 m ahead so SCAN can generate and switch
+    # to an avoidance trajectory while the controller is still following the
+    # collision-free prefix of the current spline. The independent controller
+    # braking horizon remains 0.5 m and is intentionally unchanged here.
     fsm.periodic_replan_enabled: false
     fsm.periodic_replan_interval: 0.20
-    fsm.collision_replan_horizon: 0.50
+    fsm.collision_replan_horizon: 1.20
     # Carry the controller's executable velocity into each event-driven
     # replacement spline so obstacle detours do not restart from zero speed.
     fsm.controller_velocity_timeout: 0.35
