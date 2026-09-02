@@ -1,10 +1,10 @@
 # GO2-W Bosch Mapping and Navigation
 
 GO2-W 室内三维建图、地图管理和自主导航工程。系统使用机身内置 IMU、
-Pandar XT16、LIO-SAM、Web 静态栅格 A* 和经过实机适配的 SCAN-Planner，
-并通过默认锁定的底盘安全门接入 Unitree Sport API。当前版本还包含端侧
-Remembr 语义记忆链（Qwen3.5-2B INT8 VLM + DeepSeek Flash reasoner）以及
-默认仅影子运行的 Nav2 全局/局部规划链。
+Pandar XT16 和 LIO-SAM 定位建图，由 Nav2 Smac 负责全局规划、SCAN-Planner
+负责实时三维局部轨迹，Nav2 继续负责轨迹跟踪、行为树恢复、速度平滑和碰撞
+监控，最后通过默认锁定的底盘安全门接入 Unitree Sport API。当前版本还包含
+端侧 Remembr 语义记忆链（Qwen3.5-2B INT8 VLM + DeepSeek Flash reasoner）。
 
 ## 目录
 
@@ -26,9 +26,9 @@ config/cyclonedds.xml        Foxy/Humble 跨环境 DDS 配置
 ```text
 XT16 + GO2-W 内置 IMU
         -> LIO-SAM 位姿/去畸变点云
-        -> Web 静态地图 A* 全局路径
-        -> SCAN 实时三维局部避障与 B 样条
-        -> 闭环控制器
+        -> Nav2 Smac 静态地图全局路径
+        -> SCAN 实时三维局部避障 B 样条
+        -> Nav2 Controller 跟踪、恢复、速度平滑和碰撞监控
         -> 默认锁定的底盘安全门
         -> Unitree Sport API
 ```
@@ -84,6 +84,8 @@ cd /home/unitree/go2_slam_ws
 
 ## 安全说明
 
-不要绕过 `go2_chassis_safety_gate` 将 `/scan_planner/cmd_vel_test` 直接连接到底盘。
-安全门负责显式上锁、心跳、定位有效性、姿态、点云、里程计和命令超时检查。
-任何传感器、坐标系、机器人尺寸或速度参数改动，都应先在底盘锁定状态验证。
+不要绕过 `go2_chassis_safety_gate` 将任何 SCAN/Nav2 中间速度话题直接连接到底盘。
+默认模式下 `/scan_planner/cmd_vel_test` 没有发布者，唯一执行链为 Nav2 输出经
+平滑和碰撞监控后进入安全门。安全门负责显式上锁、心跳、定位有效性、姿态、
+点云、里程计和命令超时检查。任何传感器、坐标系、机器人尺寸或速度参数改动，
+都应先在底盘锁定状态验证。

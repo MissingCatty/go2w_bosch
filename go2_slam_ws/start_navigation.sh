@@ -1,7 +1,7 @@
 #!/bin/bash
 # GO2-W 重启后一键拉起完整导航链路。
 #
-# 顺序：XT16 -> 内置 IMU/Web -> LIO-SAM -> SCAN-Planner -> Nav2 影子 -> 端侧 VLM。
+# 顺序：XT16 -> 内置 IMU/Web -> LIO-SAM -> SCAN 局部轨迹 -> Nav2 -> 端侧 VLM。
 # 该脚本绝不启用真实底盘；Linux 重启后仍需在网页完成自动定位，再由操作者
 # 显式点击“启用真实底盘”。重复执行时，如果底盘已经启用会直接拒绝操作。
 set -euo pipefail
@@ -91,7 +91,7 @@ else
     "$SCAN_WS/start_go2w_dry.sh"
 fi
 
-echo "==> [6/8] 拉起 Nav2 影子规划链"
+echo "==> [6/8] 拉起 Nav2 + SCAN 局部轨迹控制链"
 if $BUILD; then
     "$SLAM_WS/build_nav2.sh"
 fi
@@ -172,7 +172,7 @@ echo "============================================================"
 echo "完整导航服务已拉起，真实底盘保持锁定"
 echo "狗本机音量: 10%"
 echo "端侧语义记忆: $($vlm_ready && echo 'Qwen3.5 已就绪' || echo '安全降级')"
-echo "Nav2: Smac + MPPI 影子模式（真实控制仍为 SCAN）"
+echo "Nav2: Smac 全局规划 + SCAN 局部轨迹 + Nav2 控制/恢复/安全链"
 echo "控制台: http://${ip:-127.0.0.1}:8890"
 echo "下一步: 在导航页完成重启后自动定位，再手动启用真实底盘"
 echo "============================================================"

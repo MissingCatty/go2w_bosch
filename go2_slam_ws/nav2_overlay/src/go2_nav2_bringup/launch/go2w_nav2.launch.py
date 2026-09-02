@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch GO2-W Nav2 in a command-isolated shadow graph."""
+"""Launch GO2-W Nav2 with SCAN as its local trajectory generator."""
 
 import os
 

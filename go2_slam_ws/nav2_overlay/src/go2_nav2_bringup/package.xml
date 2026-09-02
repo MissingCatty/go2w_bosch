@@ -9,6 +9,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>go2_scan_nav2_controller</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>nav2_collision_monitor</exec_depend>
@@ -17,7 +18,6 @@
   <exec_depend>nav2_controller</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
-  <exec_depend>nav2_mppi_controller</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>nav2_planner</exec_depend>
   <exec_depend>nav2_smac_planner</exec_depend>

@@ -22,12 +22,10 @@ scan_planner_node:
     # A blocked local plan keeps the global target, holds zero velocity and
     # retries against the live lidar grid.  Manual cancel/completion still end it.
     fsm.replan_retry_interval: 0.20
-    # Cross-state arrival handling: the 15 cm value above still controls
-    # trajectory replanning.  A stopped ground robot may report arrival within
-    # 50 cm so a dynamically infeasible final short spline cannot leave the UI
-    # stuck in navigation forever.
+    # Nav2 is the only goal-completion authority in planner-only mode. Keep
+    # SCAN's internal stop threshold identical to Nav2's XY goal checker.
     fsm.goal_stop_speed: 0.08
-    fsm.goal_arrival_tolerance: 0.50
+    fsm.goal_arrival_tolerance: 0.30
     # Refuse all planning/output when the fused live lidar grid is stale.
     # LIO-SAM deskew occasionally has a measured processing gap up to 1.20 s
     # even while the raw XT16 remains healthy at 10 Hz.  Keep this planner-side
@@ -92,7 +90,9 @@ scan_planner_node:
     grid_map.vis_height: 0.45
     grid_map.show_occ_time: false
 
-    manager.max_vel: 0.80
+    # Match the Nav2 controller and velocity smoother so the time-parameterized
+    # local spline does not request motion that the downstream chain clips.
+    manager.max_vel: 0.50
     manager.max_acc: 0.60
     manager.max_jerk: 2.0
     manager.control_points_distance: 0.15
@@ -127,7 +127,7 @@ scan_planner_node:
     # avoidance is ten times stronger, so SCAN can take a wide live detour.
     optimization.lambda_fitness: 0.15
     optimization.dist0: 0.30
-    optimization.max_vel: 0.80
+    optimization.max_vel: 0.50
     optimization.max_acc: 0.60
     optimization.order: 3
 

@@ -1,8 +1,9 @@
 <!--
   GO2-W bounded recovery policy.
 
-  The static/global plan is reused while valid, refreshed every five seconds,
-  and rebuilt immediately when a live obstacle invalidates it.  Recoveries are
+  The static/global plan is reused while valid and rebuilt when a new goal or
+  invalid global path requires it. SCAN owns continuous local replanning, so a
+  periodic global refresh would unnecessarily reset its trajectory generation. Recoveries are
   finite: clear both dynamic costmaps, wait for a transient obstacle, back up a
   short distance, then perform one modest in-place scan turn.  The outer retry
   bound prevents an unattended robot from recovering forever.
@@ -15,9 +16,6 @@
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <Fallback name="ReuseOrComputePath">
               <ReactiveSequence name="ReuseFreshValidPath">
-                <Inverter>
-                  <PathExpiringTimer seconds="5" path="{path}"/>
-                </Inverter>
                 <Inverter>
                   <GlobalUpdatedGoal/>
                 </Inverter>
