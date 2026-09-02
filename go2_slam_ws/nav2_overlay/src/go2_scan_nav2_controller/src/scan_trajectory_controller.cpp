@@ -201,6 +201,12 @@ nav_msgs::msg::Path ScanTrajectoryController::transformPlan(const nav_msgs::msg:
     if (pose.header.frame_id.empty()) {
       pose.header.frame_id = path.header.frame_id;
     }
+    // Smac may reuse the same path during a recovery. Its original timestamp
+    // can then be older than tf2's cache even though nav_map -> odom is a
+    // constant boot-local calibration. Transform with the newest available
+    // calibration instead of requesting an expired sample.
+    pose.header.stamp.sec = 0;
+    pose.header.stamp.nanosec = 0;
     geometry_msgs::msg::PoseStamped output;
     if (pose.header.frame_id == local_frame_) {
       output = pose;

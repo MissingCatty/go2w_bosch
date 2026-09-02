@@ -298,7 +298,11 @@ velocity_smoother:
     use_sim_time: false
     smoothing_frequency: 20.0
     scale_velocities: false
-    feedback: CLOSED_LOOP
+    # LIO reports zero until a wheel command overcomes static friction. With
+    # CLOSED_LOOP the smoother restarted from that zero every 50 ms and could
+    # never ramp beyond one 0.03-unit acceleration step. The host chassis gate
+    # still applies an independent physical acceleration/deceleration limit.
+    feedback: OPEN_LOOP
     max_velocity: [0.50, 0.10, 0.45]
     min_velocity: [-0.20, -0.10, -0.45]
     max_accel: [0.60, 0.40, 0.60]
