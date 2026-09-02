@@ -9,6 +9,17 @@ CONTAINER="go2_scan_planner_dry"
 UNIT="go2-scan-planner-dry.service"
 LOG="/tmp/go2_scan_planner_dry_$(id -u).log"
 
+if systemctl --user is-active --quiet go2-front-pointlio.service; then
+  echo "错误: 前置雷达 Point-LIO 仅允许建图，导航必须先恢复 XT16 + LIO-SAM" >&2
+  exit 1
+fi
+for unit in go2-xt16.service go2-lio-sam.service; do
+  if ! systemctl --user is-active --quiet "$unit"; then
+    echo "错误: 导航定位后端未运行: $unit；请先运行 ~/go2_slam_ws/restore_lio_sam_navigation.sh" >&2
+    exit 1
+  fi
+done
+
 if [ "${1:-}" = "--build" ] || [ ! -x "$WS/build/scan_planner/scan_planner_node" ]; then
   "$WS/build_go2w.sh"
 fi
@@ -17,7 +28,6 @@ for map_file in \
   map_20260811_155640_273_nav.yaml \
   map_20260811_155640_273_nav_inflated.yaml \
   map_20260811_155640_273_nav_inflated.pgm \
-  map_20260811_155640_273_nav_obstacles.pcd \
   map_20260811_155640_273_nav.json; do
   if [ ! -r "$NAV_DIR/$map_file" ]; then
     echo "错误: 导航地图缺失: $NAV_DIR/$map_file" >&2
@@ -28,8 +38,7 @@ done
 
 status="$(curl -fsS --max-time 3 http://127.0.0.1:8890/api/status || true)"
 # 导航页会主动取消大地图订阅以节省带宽，因此这里只要求实时 LIO 位姿健康；
-# 全局 A* 由 Web 使用已保存地图；SCAN 用实时雷达绕临时障碍，同时把
-# 膨胀后的静态自由区作为不可穿越的边界。
+# 全局 A* 由 Web 使用已保存地图；SCAN 的局部规划和脱困只用实时雷达。
 if ! python3 -c 'import json,sys; h=json.loads(sys.stdin.read()).get("health",{}); sys.exit(0 if h.get("pose_online") and h.get("pose_valid") else 1)' <<<"$status"; then
   echo "错误: LIO-SAM 位姿未就绪，请先运行 ~/go2_slam_ws/start.sh" >&2
   exit 1
@@ -71,24 +80,22 @@ systemd-run --user --unit="${UNIT%.service}" --collect \
 for _ in $(seq 1 30); do
   logs="$(docker logs "$CONTAINER" 2>&1 || true)"
   if grep -q 'body=' <<<"$logs" && \
-     grep -q 'static navigation map loaded' <<<"$logs" && \
-     grep -q 'loaded immutable inflated navigation grid' <<<"$logs"; then
+     grep -q 'static navigation map loaded' <<<"$logs"; then
     break
   fi
   sleep 0.5
 done
 logs="$(docker logs "$CONTAINER" 2>&1 || true)"
 if ! grep -q 'body=' <<<"$logs" || \
-   ! grep -q 'static navigation map loaded' <<<"$logs" || \
-   ! grep -q 'loaded immutable inflated navigation grid' <<<"$logs"; then
+   ! grep -q 'static navigation map loaded' <<<"$logs"; then
   echo "错误: SCAN-Planner 位姿或导航地图服务未就绪，请检查 $LOG" >&2
   exit 1
 fi
 
 echo "SCAN-Planner 干跑模式已启动"
 echo "  全局规划: Web A* 使用保存的静态导航图"
-echo "  局部规划: 实时点云绕行 + 静态膨胀栅格防穿墙"
-echo "  碰撞体: SCAN 双圆柱模型（不将静态 3D 点混入实时占据记忆）"
+echo "  局部规划: 仅使用实时点云（不订阅静态地图或静态栅格）"
+echo "  碰撞体: SCAN 双圆柱模型"
 echo "  控制输出: /scan_planner/cmd_vel_test（仅经默认锁定的安全门转发）"
 echo "  发送前方测试目标: $WS/send_forward_test_goal.sh 1.0"
 echo "  日志: $LOG"

@@ -13,6 +13,12 @@ void load_parameter(rclcpp::Node *node, const std::string &name, T &value, const
     node->declare_parameter<T>(name, default_value);
   node->get_parameter(name, value);
 }
+
+double stampToSeconds(const builtin_interfaces::msg::Time &stamp)
+{
+  return static_cast<double>(stamp.sec) +
+         static_cast<double>(stamp.nanosec) * 1e-9;
+}
 }  // namespace
 
 void GridMap::initMap(rclcpp::Node *node)
@@ -75,6 +81,12 @@ void GridMap::initMap(rclcpp::Node *node)
   load_parameter(node_, "grid_map.use_static_map", mp_.use_static_map_, false);
   load_parameter(node_, "grid_map.use_static_navigation_grid",
                  mp_.use_static_navigation_grid_, false);
+  load_parameter(node_, "grid_map.lidar_pose_max_gap",
+                 lidar_pose_max_gap_, 0.45);
+  load_parameter(node_, "grid_map.lidar_cloud_max_wait",
+                 lidar_cloud_max_wait_, 0.65);
+  lidar_pose_max_gap_ = std::clamp(lidar_pose_max_gap_, 0.10, 1.0);
+  lidar_cloud_max_wait_ = std::clamp(lidar_cloud_max_wait_, 0.20, 2.0);
 
   mp_.lidar_extrinsic_ <<
       1.0, 0.0, 0.0, -0.01100,
@@ -210,7 +222,11 @@ void GridMap::initMap(rclcpp::Node *node)
 
   occ_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                         std::bind(&GridMap::updateOccupancyCallback, this));
-  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
+  // These PointCloud2 topics are Web/RViz visualization products only; the
+  // planner reads the in-memory occupancy buffers directly.  Publishing the
+  // full 5 cm inflated volume at 20 Hz generated ~2 MB messages and starved
+  // LIO-SAM on the 8-core Orin NX.
+  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(500),
                                         std::bind(&GridMap::visCallback, this));
 
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", rclcpp::SensorDataQoS());
@@ -1016,10 +1032,40 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
     return;
 
+  double stamp = stampToSeconds(pose_msg->header.stamp);
+  if (!std::isfinite(stamp) || stamp <= 0.0)
+    stamp = node_->now().seconds();
+
+  if (!lidar_pose_history_.empty() &&
+      stamp < lidar_pose_history_.back().stamp - 0.5)
+  {
+    RCLCPP_WARN(node_->get_logger(),
+                "[GridMap] lidar pose time jumped backwards; clearing synchronization buffers");
+    lidar_pose_history_.clear();
+    pending_lidar_clouds_.clear();
+  }
+  TimedLidarPose timed_pose;
+  timed_pose.stamp = stamp;
+  timed_pose.position = ray_pos;
+  timed_pose.orientation = ray_q;
+  if (!lidar_pose_history_.empty() &&
+      std::abs(stamp - lidar_pose_history_.back().stamp) < 1e-6)
+    lidar_pose_history_.back() = timed_pose;
+  else if (lidar_pose_history_.empty() ||
+           stamp > lidar_pose_history_.back().stamp)
+    lidar_pose_history_.push_back(timed_pose);
+  while (lidar_pose_history_.size() > 32U)
+    lidar_pose_history_.pop_front();
+
   md_.ray_pos_ = ray_pos;
   md_.ray_q_ = ray_q;
   md_.has_ray_pose_ = true;
   updateSlidingMap(md_.ray_pos_);
+  drainPendingLidarClouds();
+  // Cloud fusion temporarily installs its interpolated historical ray origin.
+  // Restore the newest pose for decay and sliding-window bookkeeping.
+  md_.ray_pos_ = ray_pos;
+  md_.ray_q_ = ray_q;
 }
 
 void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose)
@@ -1033,12 +1079,129 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   if (mp_.sensor_type_ != "lidar")
     return;
 
-  if (!md_.has_ray_pose_)
+  double stamp = stampToSeconds(img->header.stamp);
+  if (!std::isfinite(stamp) || stamp <= 0.0)
+    stamp = node_->now().seconds();
+  if (!pending_lidar_clouds_.empty() &&
+      stamp < pending_lidar_clouds_.back().stamp - 0.5)
   {
-    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                         "[GridMap] no sensor_pose received for lidar cloud update");
-    return;
+    RCLCPP_WARN(node_->get_logger(),
+                "[GridMap] lidar cloud time jumped backwards; clearing pending clouds");
+    pending_lidar_clouds_.clear();
   }
+  pending_lidar_clouds_.push_back(
+      PendingLidarCloud{stamp, node_->now().seconds(), img});
+  while (pending_lidar_clouds_.size() > 24U)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "[GridMap] dropping oldest lidar cloud because pose synchronization queue is full");
+    pending_lidar_clouds_.pop_front();
+  }
+  drainPendingLidarClouds();
+}
+
+bool GridMap::interpolateLidarPose(double stamp, Eigen::Vector3d &position,
+                                   Eigen::Quaterniond &orientation) const
+{
+  if (lidar_pose_history_.empty() ||
+      stamp < lidar_pose_history_.front().stamp - 1e-6 ||
+      stamp > lidar_pose_history_.back().stamp + 1e-6)
+    return false;
+
+  const auto upper = std::lower_bound(
+      lidar_pose_history_.begin(), lidar_pose_history_.end(), stamp,
+      [](const TimedLidarPose &pose, double value) {
+        return pose.stamp < value;
+      });
+  if (upper == lidar_pose_history_.end())
+  {
+    position = lidar_pose_history_.back().position;
+    orientation = lidar_pose_history_.back().orientation;
+    return std::abs(stamp - lidar_pose_history_.back().stamp) <= 1e-6;
+  }
+  if (upper == lidar_pose_history_.begin() ||
+      std::abs(upper->stamp - stamp) <= 1e-6)
+  {
+    position = upper->position;
+    orientation = upper->orientation;
+    return true;
+  }
+
+  const auto lower = std::prev(upper);
+  const double gap = upper->stamp - lower->stamp;
+  if (gap <= 1e-6 || gap > lidar_pose_max_gap_)
+    return false;
+  const double alpha = std::clamp((stamp - lower->stamp) / gap, 0.0, 1.0);
+  position = lower->position + alpha * (upper->position - lower->position);
+  orientation = lower->orientation.slerp(alpha, upper->orientation).normalized();
+  return true;
+}
+
+void GridMap::drainPendingLidarClouds()
+{
+  if (lidar_pose_history_.empty())
+    return;
+
+  const double now = node_->now().seconds();
+  while (!pending_lidar_clouds_.empty())
+  {
+    const PendingLidarCloud &pending = pending_lidar_clouds_.front();
+    if (pending.stamp > lidar_pose_history_.back().stamp + 1e-6)
+    {
+      if (now - pending.received <= lidar_cloud_max_wait_)
+        break;
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 2000,
+          "[GridMap] dropped lidar cloud after %.2fs waiting for matching future pose",
+          now - pending.received);
+      pending_lidar_clouds_.pop_front();
+      continue;
+    }
+    if (pending.stamp < lidar_pose_history_.front().stamp - 1e-6)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 2000,
+          "[GridMap] dropped lidar cloud older than retained pose history");
+      pending_lidar_clouds_.pop_front();
+      continue;
+    }
+
+    Eigen::Vector3d ray_pos;
+    Eigen::Quaterniond ray_q;
+    if (!interpolateLidarPose(pending.stamp, ray_pos, ray_q))
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 2000,
+          "[GridMap] dropped lidar cloud because surrounding pose gap exceeds %.2fs",
+          lidar_pose_max_gap_);
+      pending_lidar_clouds_.pop_front();
+      continue;
+    }
+
+    const auto cloud = pending.cloud;
+    pending_lidar_clouds_.pop_front();
+    processCloudWithPose(cloud, ray_pos, ray_q);
+    // Several 10 Hz clouds may become bracketed by one delayed 4 Hz LIO pose.
+    // Fuse each now rather than allowing the last one to overwrite earlier
+    // projected points before the 20 Hz occupancy timer runs.
+    updateOccupancyCallback();
+  }
+
+  if (!lidar_pose_history_.empty())
+  {
+    md_.ray_pos_ = lidar_pose_history_.back().position;
+    md_.ray_q_ = lidar_pose_history_.back().orientation;
+    md_.has_ray_pose_ = true;
+  }
+}
+
+void GridMap::processCloudWithPose(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img,
+    const Eigen::Vector3d &ray_pos, const Eigen::Quaterniond &ray_q)
+{
+  if (mp_.sensor_type_ != "lidar")
+    return;
 
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
@@ -1048,11 +1211,13 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   if (latest_cloud.points.size() == 0)
     return;
 
-  const Eigen::Matrix3d sensor_r = md_.ray_q_.toRotationMatrix();
-  const Eigen::Vector3d ray_pos = md_.ray_pos_;
+  const Eigen::Matrix3d sensor_r = ray_q.toRotationMatrix();
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
     return;
 
+  md_.ray_pos_ = ray_pos;
+  md_.ray_q_ = ray_q;
+  md_.has_ray_pose_ = true;
   updateSlidingMap(ray_pos);
 
   md_.proj_points_cnt = 0;
@@ -1238,9 +1403,10 @@ void GridMap::publishMap()
   Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
   Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
 
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z)
+  constexpr int visualization_stride = 2;
+  for (int x = min_cut(0); x <= max_cut(0); x += visualization_stride)
+    for (int y = min_cut(1); y <= max_cut(1); y += visualization_stride)
+      for (int z = min_cut(2); z <= max_cut(2); z += visualization_stride)
       {
         if (md_.occupancy_buffer_[toAddress(x, y, z)] < mp_.min_occupancy_log_)
           continue;
@@ -1279,9 +1445,10 @@ void GridMap::publishMapInflate(bool all_info)
   Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
 
   const std::vector<char> &inflate_buffer = md_.occupancy_buffer_inflate_;
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z)
+  constexpr int visualization_stride = 2;
+  for (int x = min_cut(0); x <= max_cut(0); x += visualization_stride)
+    for (int y = min_cut(1); y <= max_cut(1); y += visualization_stride)
+      for (int z = min_cut(2); z <= max_cut(2); z += visualization_stride)
       {
         if (inflate_buffer[toAddress(x, y, z)] == 0)
           continue;

@@ -65,9 +65,11 @@
     mappingSurfLeafSize: 0.2
 
     # robot motion constraint
-    # GO2-W 是平面轮式平台：限制退化环境下不可观的高度、横滚和俯仰漂移。
-    z_tollerance: 0.5
-    rotation_tollerance: 0.5
+    # 楼梯/多楼层建图必须保留 scan-to-map 优化出的真实高度；1000 m 等价于
+    # 关闭 LIO-SAM 对轨迹 z 的硬钳制；约 ±57° 的姿态范围允许陡楼梯，
+    # 同时仍阻止优化结果整圈翻转。
+    z_tollerance: 1000.0
+    rotation_tollerance: 1.0
 
     # CPU Params
     numberOfCores: 4

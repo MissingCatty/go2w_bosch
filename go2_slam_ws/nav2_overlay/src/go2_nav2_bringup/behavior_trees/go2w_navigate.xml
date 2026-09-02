@@ -1,0 +1,54 @@
+<!--
+  GO2-W bounded recovery policy.
+
+  The static/global plan is reused while valid, refreshed every five seconds,
+  and rebuilt immediately when a live obstacle invalidates it.  Recoveries are
+  finite: clear both dynamic costmaps, wait for a transient obstacle, back up a
+  short distance, then perform one modest in-place scan turn.  The outer retry
+  bound prevents an unattended robot from recovering forever.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="4" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithValidatedReplanning">
+        <RateController hz="2.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback name="ReuseOrComputePath">
+              <ReactiveSequence name="ReuseFreshValidPath">
+                <Inverter>
+                  <PathExpiringTimer seconds="5" path="{path}"/>
+                </Inverter>
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
+              </ReactiveSequence>
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            </Fallback>
+            <ClearEntireCostmap name="ClearGlobalCostmapContext"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmapContext"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="BoundedRecoveryActions">
+          <Sequence name="ClearDynamicLayers">
+            <ClearEntireCostmap name="ClearLocalCostmap"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Wait wait_duration="3"/>
+          <BackUp backup_dist="0.20" backup_speed="0.05"/>
+          <Spin spin_dist="0.78"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

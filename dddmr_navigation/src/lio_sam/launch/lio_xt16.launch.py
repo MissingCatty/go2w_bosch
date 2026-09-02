@@ -29,7 +29,13 @@ def generate_launch_description():
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments='0.1701 0.0 0.0908 0.0 0.0 1.57079632679 base_link rslidar'.split(' '),
+            # GO2-W calibration is a +90 degree yaw.  Named arguments avoid
+            # the legacy positional yaw/pitch/roll ordering ambiguity.
+            arguments=[
+                '--x', '0.1701', '--y', '0.0', '--z', '0.0908',
+                '--roll', '0.0', '--pitch', '0.0', '--yaw', '1.57079632679',
+                '--frame-id', 'base_link', '--child-frame-id', 'rslidar',
+            ],
             parameters=[parameter_file],
             output='screen'
             ),

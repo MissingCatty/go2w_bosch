@@ -28,6 +28,9 @@ core.*
 
 # Vendor binaries are installed separately on the robot
 go2_slam_ws/module/
+go2_slam_ws/models/
+go2_slam_ws/third_party/
+*.gguf
 
 # Credentials and local environment overrides
 .env
@@ -36,4 +39,3 @@ go2_slam_ws/module/
 *.key
 id_rsa*
 id_ed25519*
-

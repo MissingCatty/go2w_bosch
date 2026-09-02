@@ -7,6 +7,7 @@
 #include <cv_bridge/cv_bridge.h>
 #include <cstdint>
 #include <cmath>
+#include <deque>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <random>
@@ -224,6 +225,12 @@ private:
   void sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
+  void processCloudWithPose(
+      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud,
+      const Eigen::Vector3d& ray_pos, const Eigen::Quaterniond& ray_q);
+  void drainPendingLidarClouds();
+  bool interpolateLidarPose(double stamp, Eigen::Vector3d& position,
+                            Eigen::Quaterniond& orientation) const;
   void staticCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud);
   void staticNavigationGridCallback(
       const nav_msgs::msg::OccupancyGrid::ConstSharedPtr& grid);
@@ -274,6 +281,21 @@ private:
   shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> depth_sub_;
   shared_ptr<message_filters::Subscriber<nav_msgs::msg::Odometry>> depth_pose_sub_;
   SynchronizerImagePose sync_image_pose_;
+
+  struct TimedLidarPose {
+    double stamp{0.0};
+    Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+    Eigen::Quaterniond orientation{Eigen::Quaterniond::Identity()};
+  };
+  struct PendingLidarCloud {
+    double stamp{0.0};
+    double received{0.0};
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
+  };
+  std::deque<TimedLidarPose> lidar_pose_history_;
+  std::deque<PendingLidarCloud> pending_lidar_clouds_;
+  double lidar_pose_max_gap_{0.45};
+  double lidar_cloud_max_wait_{0.65};
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lidar_pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sliding_map_frame_sub_;

@@ -1,0 +1,13 @@
+build/
+install/
+log/
+maps/
+models/
+module/
+third_party/
+.pytest_cache/
+nav2_overlay/build/
+nav2_overlay/install/
+nav2_overlay/log/
+*.pcd
+*.npz

@@ -60,6 +60,10 @@ namespace scan_planner
       if (!node->has_parameter(name)) node->declare_parameter<double>(name, default_value);
       return node->get_parameter(name).as_double();
     };
+    const auto get_string = [node](const std::string &name, const std::string &default_value) {
+      if (!node->has_parameter(name)) node->declare_parameter<std::string>(name, default_value);
+      return node->get_parameter(name).as_string();
+    };
     pp_.max_vel_ = get_double("manager.max_vel", -1.0);
     pp_.max_acc_ = get_double("manager.max_acc", -1.0);
     pp_.max_jerk_ = get_double("manager.max_jerk", -1.0);
@@ -68,8 +72,6 @@ namespace scan_planner
     pp_.feasibility_tolerance_ = get_double("manager.feasibility_tolerance", 0.0);
     pp_.ctrl_pt_dist = get_double("manager.control_points_distance", -1.0);
     pp_.planning_horizon_ = get_double("manager.planning_horizon", 5.0);
-    pp_.reference_corridor_tolerance_ =
-        get_double("manager.reference_corridor_tolerance", 0.08);
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);
@@ -80,6 +82,37 @@ namespace scan_planner
     bspline_optimizer_rebound_->setEnvironment(grid_map_);
     bspline_optimizer_rebound_->a_star_.reset(new AStar);
     bspline_optimizer_rebound_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
+    const double astar_clearance_distance =
+        get_double("astar.clearance_distance", 0.0);
+    const double astar_clearance_weight =
+        get_double("astar.clearance_weight", 0.0);
+    bspline_optimizer_rebound_->a_star_->setClearanceCost(
+        astar_clearance_distance, astar_clearance_weight);
+
+    const std::string bspline_generator =
+        get_string("manager.bspline_generator", "legacy");
+    use_curvature_bspline_ = bspline_generator == "curvature_constrained";
+    if (use_curvature_bspline_)
+    {
+      curvature_bspline_optimizer_.reset(new CurvatureBsplineOptimizer);
+      curvature_bspline_optimizer_->setParam(node_);
+      curvature_bspline_optimizer_->setEnvironment(grid_map_);
+      // Share the already initialized search graph. The alternative optimizer
+      // is lightweight and does not allocate a second 100^3 A-star pool.
+      curvature_bspline_optimizer_->a_star_ =
+          bspline_optimizer_rebound_->a_star_;
+    }
+    else if (bspline_generator != "legacy")
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Unknown manager.bspline_generator '%s'; using legacy",
+                  bspline_generator.c_str());
+    }
+    RCLCPP_INFO(node_->get_logger(), "B-spline generator: %s",
+                use_curvature_bspline_ ? "curvature_constrained" : "legacy");
+    RCLCPP_INFO(node_->get_logger(),
+                "Local A-star clearance cost: distance=%.2fm weight=%.2f",
+                astar_clearance_distance, astar_clearance_weight);
 
     visualization_ = vis;
   }
@@ -87,6 +120,26 @@ namespace scan_planner
   // !SECTION
 
   // SECTION rebond replanning
+
+  bool SCANPlannerManager::searchLivePath(
+      const Eigen::Vector3d &start_pt, const Eigen::Vector3d &end_pt,
+      std::vector<Eigen::Vector3d> &path)
+  {
+    path.clear();
+    const AStar::Ptr active_a_star = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->a_star_
+        : bspline_optimizer_rebound_->a_star_;
+    if (!grid_map_ || !active_a_star)
+      return false;
+
+    const ASTAR_RET result = active_a_star->AstarSearch(
+        grid_map_->getResolution(), start_pt, end_pt);
+    if (result != ASTAR_RET::SUCCESS)
+      return false;
+
+    path = active_a_star->getPath();
+    return path.size() >= 2;
+  }
 
   bool SCANPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
@@ -354,16 +407,21 @@ namespace scan_planner
     UniformBspline reference_traj(ctrl_pts, 3, ts);
     const double reference_dt = reference_traj.getTimeSum() /
                                 std::max<Eigen::Index>(1, ctrl_pts.cols() - 3);
-    bspline_optimizer_rebound_->ref_pts_.clear();
+    auto &active_reference_points = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->ref_pts_
+        : bspline_optimizer_rebound_->ref_pts_;
+    active_reference_points.clear();
     for (double reference_t = 0.0;
          reference_t < reference_traj.getTimeSum() + 1e-4;
          reference_t += reference_dt)
-      bspline_optimizer_rebound_->ref_pts_.push_back(
+      active_reference_points.push_back(
           reference_traj.evaluateDeBoorT(
               std::min(reference_t, reference_traj.getTimeSum())));
 
     vector<vector<Eigen::Vector3d>> a_star_paths;
-    a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
+    a_star_paths = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->initControlPoints(ctrl_pts, true)
+        : bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
 
     t_init = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
@@ -374,7 +432,9 @@ namespace scan_planner
     t_start = std::chrono::steady_clock::now();
 
     /*** STEP 2: OPTIMIZE ***/
-    bool flag_step_1_success = bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
+    bool flag_step_1_success = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->BsplineOptimizeTrajRebound(ctrl_pts, ts)
+        : bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
@@ -404,8 +464,7 @@ namespace scan_planner
     }
 
     if (!flag_step_2_success || !checkDynamicFeasibility(pos) ||
-        !checkTrajectoryCollision(pos) ||
-        !checkReferenceCorridor(pos, reference_points))
+        !checkTrajectoryCollision(pos))
     {
       printf("\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
       continuous_failures_count_++;
@@ -610,11 +669,18 @@ namespace scan_planner
     traj = UniformBspline(ctrl_pts, 3, ts);
 
     double t_step = traj.getTimeSum() / (ctrl_pts.cols() - 3);
-    bspline_optimizer_rebound_->ref_pts_.clear();
+    auto &active_reference_points = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->ref_pts_
+        : bspline_optimizer_rebound_->ref_pts_;
+    active_reference_points.clear();
     for (double t = 0; t < traj.getTimeSum() + 1e-4; t += t_step)
-      bspline_optimizer_rebound_->ref_pts_.push_back(traj.evaluateDeBoorT(t));
+      active_reference_points.push_back(traj.evaluateDeBoorT(t));
 
-    bool success = bspline_optimizer_rebound_->BsplineOptimizeTrajRefine(ctrl_pts, ts, optimal_control_points);
+    bool success = use_curvature_bspline_
+        ? curvature_bspline_optimizer_->BsplineOptimizeTrajRefine(
+              ctrl_pts, ts, optimal_control_points)
+        : bspline_optimizer_rebound_->BsplineOptimizeTrajRefine(
+              ctrl_pts, ts, optimal_control_points);
 
     return success;
   }
@@ -679,61 +745,6 @@ namespace scan_planner
         RCLCPP_WARN(node_->get_logger(),
                     "Final local trajectory collision check failed at t=%.3f, point=(%.2f, %.2f, %.2f)",
                     tc, position(0), position(1), position(2));
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool SCANPlannerManager::checkReferenceCorridor(
-      UniformBspline position_traj,
-      const std::vector<Eigen::Vector3d> &reference_points)
-  {
-    if (reference_points.empty())
-      return true;
-
-    std::vector<Eigen::Vector2d> polyline;
-    polyline.reserve(reference_points.size() + 1);
-    polyline.push_back(position_traj.evaluateDeBoorT(0.0).head<2>());
-    for (const auto &point : reference_points)
-    {
-      const Eigen::Vector2d xy = point.head<2>();
-      if ((xy - polyline.back()).norm() > 1e-4)
-        polyline.push_back(xy);
-    }
-    if (polyline.size() < 2)
-      return true;
-
-    const auto point_segment_distance = [](
-        const Eigen::Vector2d &point, const Eigen::Vector2d &from,
-        const Eigen::Vector2d &to) {
-      const Eigen::Vector2d segment = to - from;
-      const double length_sq = segment.squaredNorm();
-      const double ratio = length_sq > 1e-12
-                               ? std::clamp((point - from).dot(segment) / length_sq,
-                                            0.0, 1.0)
-                               : 0.0;
-      return (point - (from + ratio * segment)).norm();
-    };
-
-    const double duration = position_traj.getTimeSum();
-    constexpr double sample_dt = 0.02;
-    for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
-    {
-      const double tc = std::min(t, duration);
-      const Eigen::Vector2d position =
-          position_traj.evaluateDeBoorT(tc).head<2>();
-      double min_distance = std::numeric_limits<double>::infinity();
-      for (size_t i = 1; i < polyline.size(); ++i)
-        min_distance = std::min(
-            min_distance,
-            point_segment_distance(position, polyline[i - 1], polyline[i]));
-      if (min_distance > pp_.reference_corridor_tolerance_)
-      {
-        RCLCPP_WARN(node_->get_logger(),
-                    "Final local trajectory left global corridor at t=%.3f: "
-                    "deviation=%.3f > %.3f",
-                    tc, min_distance, pp_.reference_corridor_tolerance_);
         return false;
       }
     }

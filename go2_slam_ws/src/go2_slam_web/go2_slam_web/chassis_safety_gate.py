@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed bridge from SCAN velocity commands to the GO2-W Sport API.
+"""Fail-closed bridge from one selected navigation backend to GO2-W Sport API.
 
 The node starts locked.  A fresh explicit arm request is required after every
 cancel, health fault or process restart.  While armed it also requires fresh
@@ -58,7 +58,15 @@ class ChassisSafetyGate(Node):
         self.max_vy = float(self.declare_parameter('max_vy', 0.10).value)
         self.max_vyaw = float(self.declare_parameter('max_vyaw', 0.45).value)
         self.max_accel = float(self.declare_parameter('max_accel', 0.60).value)
+        # Acceleration stays gentle, while a lower planner target is allowed
+        # to brake substantially faster. Emergency live-obstacle stops bypass
+        # both slew limits below.
+        self.max_decel = float(self.declare_parameter('max_decel', 1.50).value)
         self.max_yaw_accel = float(self.declare_parameter('max_yaw_accel', 0.60).value)
+        self.max_yaw_decel = float(
+            self.declare_parameter('max_yaw_decel', 1.20).value)
+        self.emergency_stop_timeout = float(
+            self.declare_parameter('emergency_stop_timeout', 0.20).value)
         self.cmd_timeout = float(self.declare_parameter('cmd_timeout', 0.30).value)
         self.teleop_timeout = float(self.declare_parameter('teleop_timeout', 0.35).value)
         self.odom_timeout = float(self.declare_parameter('odom_timeout', 0.75).value)
@@ -66,13 +74,25 @@ class ChassisSafetyGate(Node):
         self.heartbeat_timeout = float(self.declare_parameter('heartbeat_timeout', 1.00).value)
         self.max_tilt = float(self.declare_parameter('max_tilt', 0.55).value)
 
+        default_backend = str(
+            self.declare_parameter('navigation_backend', 'scan').value).lower()
+        self.navigation_backend = (
+            default_backend if default_backend in ('scan', 'nav2') else 'scan')
+        self.backend_switch_error = ''
+
         self.request_pub = self.create_publisher(Request, '/api/sport/request', 10)
         self.create_subscription(
             Response, '/api/sport/response', self.on_sport_response, 10)
         self.enabled_pub = self.create_publisher(Bool, '/scan_planner/chassis_enabled', 10)
         self.status_pub = self.create_publisher(String, '/scan_planner/chassis_status', 10)
         self.create_subscription(
-            Twist, '/scan_planner/cmd_vel_test', self.on_command, 20)
+            Twist, '/scan_planner/cmd_vel_test', self.on_scan_command, 20)
+        self.create_subscription(
+            Twist, '/go2/nav2/cmd_vel_safe', self.on_nav2_command, 20)
+        self.create_subscription(
+            String, '/go2/navigation/backend', self.on_navigation_backend, 10)
+        self.create_subscription(
+            Bool, '/scan_planner/emergency_stop', self.on_emergency_stop, 20)
         self.create_subscription(
             Twist, '/scan_planner/teleop_cmd', self.on_teleop_command, 20)
         self.create_subscription(
@@ -87,8 +107,21 @@ class ChassisSafetyGate(Node):
         self.create_subscription(
             Odometry, '/scan_planner/body_pose', self.on_odometry,
             qos_profile_sensor_data)
+        # The transformed body pose is republished from the Humble SCAN
+        # container.  Fast-DDS best-effort delivery across the container/host
+        # boundary can occasionally drop it for longer than the navigation
+        # watchdog even while the original LIO stream remains healthy.  The
+        # safety gate only needs an independent localization heartbeat here,
+        # so retain body_pose and also listen to its raw LIO source.
         self.create_subscription(
-            LowState, '/lowstate', self.on_lowstate, qos_profile_sensor_data)
+            Odometry, '/lio_sam/mapping/odometry', self.on_raw_odometry,
+            qos_profile_sensor_data)
+        self.create_subscription(
+            # The gate checks tilt, not high-rate state estimation.  Use the
+            # robot's 20 Hz low-frequency mirror; LIO's IMU bridge remains on
+            # the original ~200 Hz /lowstate stream.
+            LowState, '/lf/lowstate', self.on_lowstate,
+            qos_profile_sensor_data)
         self.create_subscription(
             SportModeState, '/lf/sportmodestate', self.on_sport_state,
             qos_profile_sensor_data)
@@ -107,16 +140,23 @@ class ChassisSafetyGate(Node):
         self.armed = False
         self.cancelled = True
         self.teleop_enabled = False
-        self.latest_cmd = (0.0, 0.0, 0.0)
+        self.planner_cmds = {
+            'scan': (0.0, 0.0, 0.0),
+            'nav2': (0.0, 0.0, 0.0),
+        }
         self.teleop_cmd = (0.0, 0.0, 0.0)
         self.recovery_cmd = (0.0, 0.0, 0.0)
         self.output = (0.0, 0.0, 0.0)
-        self.cmd_t = None
+        self.planner_cmd_times = {'scan': None, 'nav2': None}
         self.teleop_cmd_t = None
         self.recovery_cmd_t = None
         self.recovery_active = False
         self.local_waiting = False
+        self.emergency_stop = False
+        self.emergency_stop_t = None
+        self.emergency_stop_applied = False
         self.odom_t = None
+        self.raw_odom_t = None
         self.lowstate_t = None
         self.heartbeat_t = None
         self.alignment_t = None
@@ -146,22 +186,70 @@ class ChassisSafetyGate(Node):
         self.create_timer(0.05, self.tick)
         self.create_timer(0.20, self.publish_status)
         self.get_logger().info(
-            'GO2-W chassis gate ready and LOCKED: navigation %.2f/%.2f m/s, '
-            'teleop %.2f/%.2f m/s, yaw %.2f rad/s' %
-            (self.max_vx, self.max_vy, self.teleop_max_vx,
+            'GO2-W chassis gate ready and LOCKED: backend=%s, '
+            'navigation %.2f/%.2f m/s, teleop %.2f/%.2f m/s, yaw %.2f rad/s' %
+            (self.navigation_backend, self.max_vx, self.max_vy, self.teleop_max_vx,
              self.max_vy, self.max_vyaw))
 
-    def on_command(self, msg):
+    def store_planner_command(self, backend, msg):
         values = (msg.linear.x, msg.linear.y, msg.angular.z)
         if not all(math.isfinite(float(value)) for value in values):
-            self.trip('收到非有限速度指令')
+            if backend == self.navigation_backend:
+                self.trip('收到%s非有限速度指令' % backend.upper())
             return
-        self.latest_cmd = (
+        self.planner_cmds[backend] = (
             clamp(values[0], self.max_vx),
             clamp(values[1], self.max_vy),
             clamp(values[2], self.max_vyaw),
         )
-        self.cmd_t = time.monotonic()
+        self.planner_cmd_times[backend] = time.monotonic()
+
+    def on_scan_command(self, msg):
+        self.store_planner_command('scan', msg)
+
+    def on_nav2_command(self, msg):
+        self.store_planner_command('nav2', msg)
+
+    def on_navigation_backend(self, msg):
+        requested = str(msg.data or '').strip().lower()
+        if requested not in ('scan', 'nav2'):
+            self.backend_switch_error = '未知导航后端: %s' % requested
+            self.get_logger().error(self.backend_switch_error)
+            return
+        if requested == self.navigation_backend:
+            self.backend_switch_error = ''
+            return
+        # Backend handover is a maintenance operation. It is never accepted
+        # while the physical gate is armed, even if both command streams are
+        # currently zero, because their timestamps are independent.
+        if self.armed:
+            self.backend_switch_error = (
+                '底盘启用期间拒绝从%s切换到%s' %
+                (self.navigation_backend.upper(), requested.upper()))
+            self.get_logger().error(self.backend_switch_error)
+            return
+        self.navigation_backend = requested
+        self.backend_switch_error = ''
+        self.cancelled = True
+        self.planner_cmds = {
+            'scan': (0.0, 0.0, 0.0),
+            'nav2': (0.0, 0.0, 0.0),
+        }
+        self.planner_cmd_times = {'scan': None, 'nav2': None}
+        self.recovery_active = False
+        self.recovery_cmd = (0.0, 0.0, 0.0)
+        self.recovery_cmd_t = None
+        self.local_waiting = False
+        self.reason = '已选择%s，底盘保持锁定' % requested.upper()
+        self.get_logger().warn(
+            'Navigation backend selected: %s; chassis remains LOCKED' %
+            requested)
+
+    def on_emergency_stop(self, msg):
+        self.emergency_stop = bool(msg.data)
+        self.emergency_stop_t = time.monotonic()
+        if not self.emergency_stop:
+            self.emergency_stop_applied = False
 
     def on_teleop_command(self, msg):
         values = (msg.linear.x, msg.linear.y, msg.angular.z)
@@ -229,6 +317,18 @@ class ChassisSafetyGate(Node):
 
     def on_odometry(self, _msg):
         self.odom_t = time.monotonic()
+
+    def on_raw_odometry(self, _msg):
+        self.raw_odom_t = time.monotonic()
+
+    def navigation_odom_age(self, now=None):
+        """Age of the freshest independent navigation pose source."""
+        now = time.monotonic() if now is None else now
+        ages = [
+            now - stamp for stamp in (self.odom_t, self.raw_odom_t)
+            if stamp is not None
+        ]
+        return min(ages) if ages else None
 
     def on_lowstate(self, msg):
         rpy = msg.imu_state.rpy
@@ -316,7 +416,8 @@ class ChassisSafetyGate(Node):
         # physical/communications watchdogs above apply.  Autonomous
         # navigation retains both localization checks.
         if not self.teleop_enabled:
-            if self.odom_t is None or now - self.odom_t > self.odom_timeout:
+            odom_age = self.navigation_odom_age(now)
+            if odom_age is None or odom_age > self.odom_timeout:
                 return '导航里程计超时'
             if (not self.alignment_valid or self.alignment_t is None or
                     now - self.alignment_t > self.heartbeat_timeout):
@@ -402,9 +503,12 @@ class ChassisSafetyGate(Node):
         # both navigation and teleop before the action can reach Sport API.
         self.cancelled = True
         self.teleop_enabled = False
-        self.latest_cmd = (0.0, 0.0, 0.0)
+        self.planner_cmds = {
+            'scan': (0.0, 0.0, 0.0),
+            'nav2': (0.0, 0.0, 0.0),
+        }
         self.teleop_cmd = (0.0, 0.0, 0.0)
-        self.cmd_t = None
+        self.planner_cmd_times = {'scan': None, 'nav2': None}
         self.teleop_cmd_t = None
         self.recovery_active = False
         self.recovery_cmd = (0.0, 0.0, 0.0)
@@ -506,6 +610,14 @@ class ChassisSafetyGate(Node):
     @staticmethod
     def slew(current, target, delta):
         return current + clamp(target - current, delta)
+
+    @staticmethod
+    def slew_with_braking(current, target, accel, decel, dt):
+        braking = (
+            abs(target) < abs(current) or
+            (abs(current) > 1e-6 and current * target <= 0.0))
+        return ChassisSafetyGate.slew(
+            current, target, (decel if braking else accel) * dt)
 
     def tick(self):
         now = time.monotonic()
@@ -689,6 +801,22 @@ class ChassisSafetyGate(Node):
         if fault:
             self.trip(fault)
             return
+        emergency_active = (
+            not self.teleop_enabled and self.emergency_stop and
+            self.emergency_stop_t is not None and
+            now - self.emergency_stop_t <= self.emergency_stop_timeout)
+        if emergency_active:
+            self.output = (0.0, 0.0, 0.0)
+            if not self.emergency_stop_applied:
+                self.publish_stop()
+                self.emergency_stop_applied = True
+                self.get_logger().warn(
+                    'LIVE OBSTACLE emergency stop; navigation remains armed')
+            else:
+                self.publish_move(0.0, 0.0, 0.0)
+            self.reason = '实时障碍进入紧急刹车距离，原地等待重新规划'
+            return
+        self.emergency_stop_applied = False
         if self.teleop_enabled:
             selected_cmd = self.teleop_cmd
             selected_cmd_t = self.teleop_cmd_t
@@ -701,18 +829,22 @@ class ChassisSafetyGate(Node):
             # Recovery is a separate, tightly scoped command source.  It may
             # override SCAN only while both producers agree that SCAN is in
             # WAIT_REPLAN. Any topic loss falls back to the normal watchdog.
-            if self.recovery_active and self.local_waiting:
+            if (self.navigation_backend == 'scan' and
+                    self.recovery_active and self.local_waiting):
                 selected_cmd = self.recovery_cmd
                 selected_cmd_t = self.recovery_cmd_t
                 selected_timeout = self.cmd_timeout
                 missing_reason = '脱困已激活但未收到脱困速度指令'
                 stale_reason = '脱困速度指令超时'
             else:
-                selected_cmd = self.latest_cmd
-                selected_cmd_t = self.cmd_t
+                selected_cmd = self.planner_cmds[self.navigation_backend]
+                selected_cmd_t = self.planner_cmd_times[
+                    self.navigation_backend]
                 selected_timeout = self.cmd_timeout
-                missing_reason = '启用后未收到新的规划器指令'
-                stale_reason = '规划器速度指令超时'
+                missing_reason = '启用后未收到新的%s指令' % (
+                    self.navigation_backend.upper())
+                stale_reason = '%s速度指令超时' % (
+                    self.navigation_backend.upper())
         if selected_cmd_t is None or selected_cmd_t < self.armed_t:
             if now - self.armed_t > 1.0:
                 self.trip(missing_reason)
@@ -721,16 +853,22 @@ class ChassisSafetyGate(Node):
             self.trip(stale_reason)
             return
 
-        vx = self.slew(self.output[0], selected_cmd[0], self.max_accel * dt)
-        vy = self.slew(self.output[1], selected_cmd[1], self.max_accel * dt)
-        vyaw = self.slew(
-            self.output[2], selected_cmd[2], self.max_yaw_accel * dt)
+        vx = self.slew_with_braking(
+            self.output[0], selected_cmd[0], self.max_accel,
+            self.max_decel, dt)
+        vy = self.slew_with_braking(
+            self.output[1], selected_cmd[1], self.max_accel,
+            self.max_decel, dt)
+        vyaw = self.slew_with_braking(
+            self.output[2], selected_cmd[2], self.max_yaw_accel,
+            self.max_yaw_decel, dt)
         self.output = (vx, vy, vyaw)
         self.publish_move(vx, vy, vyaw)
         moving = any(abs(value) > 1e-3 for value in self.output)
         if self.teleop_enabled:
             self.reason = '底盘正在执行键盘控制' if moving else '键盘控制已启用，等待按键'
-        elif self.recovery_active and self.local_waiting:
+        elif (self.navigation_backend == 'scan' and
+              self.recovery_active and self.local_waiting):
             self.reason = '底盘正在执行实时点云脱困' if moving else '实时点云脱困已激活，保持零速'
         else:
             self.reason = '底盘正在执行导航' if moving else '底盘已启用，等待运动指令'
@@ -738,6 +876,8 @@ class ChassisSafetyGate(Node):
     def publish_status(self):
         now = time.monotonic()
         fault = self.health_fault(now)
+        navigation_odom_age = self.navigation_odom_age(now)
+        selected_planner_t = self.planner_cmd_times[self.navigation_backend]
         status = {
             'connected': self.request_pub.get_subscription_count() > 0,
             'enabled': self.armed,
@@ -766,22 +906,39 @@ class ChassisSafetyGate(Node):
                 None if self.sport_state_t is None else
                 round(now - self.sport_state_t, 3)),
             'control_mode': ('teleop' if self.teleop_enabled else
-                             ('recovery' if self.recovery_active and
+                             ('recovery' if self.navigation_backend == 'scan' and
+                              self.recovery_active and
                               self.local_waiting else 'navigation')),
+            'navigation_backend': self.navigation_backend,
+            'backend_switch_error': self.backend_switch_error,
             'teleop_enabled': self.teleop_enabled,
             'ready': not bool(fault),
             'reason': self.reason if (
                 self.posture_state != 'movable' or not fault or self.armed
             ) else fault,
-            'cmd_age': None if (self.teleop_cmd_t if self.teleop_enabled else self.cmd_t) is None else round(
-                now - (self.teleop_cmd_t if self.teleop_enabled else self.cmd_t), 3),
-            'planner_cmd_age': None if self.cmd_t is None else round(now - self.cmd_t, 3),
+            'cmd_age': None if (
+                self.teleop_cmd_t if self.teleop_enabled else selected_planner_t
+            ) is None else round(now - (
+                self.teleop_cmd_t if self.teleop_enabled else selected_planner_t), 3),
+            'planner_cmd_age': None if selected_planner_t is None else round(
+                now - selected_planner_t, 3),
+            'scan_cmd_age': None if self.planner_cmd_times['scan'] is None else round(
+                now - self.planner_cmd_times['scan'], 3),
+            'nav2_cmd_age': None if self.planner_cmd_times['nav2'] is None else round(
+                now - self.planner_cmd_times['nav2'], 3),
             'teleop_cmd_age': None if self.teleop_cmd_t is None else round(
                 now - self.teleop_cmd_t, 3),
-            'recovery_active': bool(self.recovery_active and self.local_waiting),
+            'recovery_active': bool(
+                self.navigation_backend == 'scan' and self.recovery_active and
+                self.local_waiting),
             'recovery_cmd_age': None if self.recovery_cmd_t is None else round(
                 now - self.recovery_cmd_t, 3),
-            'odom_age': None if self.odom_t is None else round(now - self.odom_t, 3),
+            'odom_age': None if navigation_odom_age is None else round(
+                navigation_odom_age, 3),
+            'body_odom_age': None if self.odom_t is None else round(
+                now - self.odom_t, 3),
+            'raw_odom_age': None if self.raw_odom_t is None else round(
+                now - self.raw_odom_t, 3),
             'lowstate_age': None if self.lowstate_t is None else round(now - self.lowstate_t, 3),
             'heartbeat_age': None if self.heartbeat_t is None else round(now - self.heartbeat_t, 3),
             'alignment_valid': self.alignment_valid,

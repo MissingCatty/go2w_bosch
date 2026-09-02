@@ -34,8 +34,13 @@ ament_target_dependencies(plan_env
 )
 target_link_libraries(plan_env Eigen3::Eigen ${PCL_LIBRARIES} ${OpenCV_LIBS})
 
+add_executable(near_field_cloud_fuser src/near_field_cloud_fuser.cpp)
+ament_target_dependencies(near_field_cloud_fuser rclcpp sensor_msgs)
+
 install(TARGETS plan_env EXPORT export_plan_env
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+install(TARGETS near_field_cloud_fuser
+  RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 ament_export_targets(export_plan_env HAS_LIBRARY_TARGET)
 ament_export_dependencies(

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include <bspline_opt/bspline_optimizer.h>
+#include <bspline_opt/curvature_bspline_optimizer.h>
 #include <bspline_opt/uniform_bspline.h>
 #include <plan_env/grid_map.h>
 #include <plan_manage/plan_container.hpp>
@@ -30,6 +31,9 @@ namespace scan_planner
                        Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit,
                        bool flag_randomPolyTraj,
                        const std::vector<Eigen::Vector3d> &reference_points = {});
+    bool searchLivePath(const Eigen::Vector3d &start_pt,
+                        const Eigen::Vector3d &end_pt,
+                        std::vector<Eigen::Vector3d> &path);
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
@@ -49,15 +53,14 @@ namespace scan_planner
     PlanningVisualization::Ptr visualization_;
 
     BsplineOptimizer::Ptr bspline_optimizer_rebound_;
+    CurvatureBsplineOptimizer::Ptr curvature_bspline_optimizer_;
+    bool use_curvature_bspline_{false};
 
     int continuous_failures_count_{0};
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
     bool checkDynamicFeasibility(UniformBspline position_traj);
     bool checkTrajectoryCollision(UniformBspline position_traj);
-    bool checkReferenceCorridor(
-        UniformBspline position_traj,
-        const std::vector<Eigen::Vector3d> &reference_points);
 
     void reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt,
                         double &time_inc);

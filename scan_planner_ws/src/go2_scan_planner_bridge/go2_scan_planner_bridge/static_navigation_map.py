@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a processed GO2-W navigation map and SCAN static obstacle layer."""
+"""Publish processed GO2-W grids for global routing and visualization."""
 
 import json
 import hashlib
@@ -14,7 +14,6 @@ from nav_msgs.msg import OccupancyGrid
 from nav_msgs.srv import GetMap
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String
 
 
@@ -43,26 +42,6 @@ def read_pgm(path):
     return pixels.reshape(height, width)
 
 
-def read_ascii_pcd(path):
-    with open(path, 'r', encoding='ascii') as stream:
-        data_mode = None
-        rows = []
-        for line in stream:
-            stripped = line.strip()
-            if data_mode is None:
-                if stripped.upper().startswith('DATA '):
-                    data_mode = stripped.split(None, 1)[1].lower()
-                    if data_mode != 'ascii':
-                        raise ValueError('only ASCII PCD files are supported')
-                continue
-            if stripped:
-                values = stripped.split()
-                rows.append((float(values[0]), float(values[1]), float(values[2])))
-    if data_mode is None:
-        raise ValueError('PCD DATA header is missing')
-    return np.asarray(rows, dtype=np.float32).reshape(-1, 3)
-
-
 def boot_id():
     try:
         with open('/proc/sys/kernel/random/boot_id', 'r', encoding='ascii') as stream:
@@ -84,7 +63,6 @@ class StaticNavigationMap(Node):
         super().__init__('go2_static_navigation_map')
         self.declare_parameter('map_yaml', '')
         self.declare_parameter('inflated_map_yaml', '')
-        self.declare_parameter('obstacle_pcd', '')
         self.declare_parameter('metadata_json', '')
         self.declare_parameter('alignment_json', '')
         self.declare_parameter('frame_id', 'odom')
@@ -96,7 +74,6 @@ class StaticNavigationMap(Node):
 
         map_yaml = str(self.get_parameter('map_yaml').value)
         inflated_map_yaml = str(self.get_parameter('inflated_map_yaml').value)
-        obstacle_pcd = str(self.get_parameter('obstacle_pcd').value)
         metadata_json = str(self.get_parameter('metadata_json').value)
         alignment_json = str(self.get_parameter('alignment_json').value)
         self.frame_id = str(self.get_parameter('frame_id').value)
@@ -141,38 +118,28 @@ class StaticNavigationMap(Node):
         if not inflated_map_yaml or not os.path.isfile(inflated_map_yaml):
             raise FileNotFoundError(
                 'inflated navigation map YAML not found: %s' % inflated_map_yaml)
-        if not obstacle_pcd or not os.path.isfile(obstacle_pcd):
-            raise FileNotFoundError('navigation obstacle PCD not found: %s' % obstacle_pcd)
-
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.map_pub = self.create_publisher(OccupancyGrid, '/navigation/map', qos)
-        # Keep the footprint-inflated grid separate from the live voxel map.
-        # SCAN treats it as an immutable wall/free-space boundary while the
-        # lidar layer remains responsible for chairs, people and other
-        # temporary obstacles.
+        # Publish the saved grids for global route planning and visualization.
+        # Local SCAN collision checking intentionally does not subscribe here.
         self.inflated_map_pub = self.create_publisher(
             OccupancyGrid, '/navigation/inflated_map', qos)
-        self.cloud_pub = self.create_publisher(
-            PointCloud2, '/scan_planner/static_obstacles', qos)
         self.metadata_pub = self.create_publisher(String, '/navigation/map_metadata', qos)
         self.map_service = self.create_service(GetMap, '/navigation/static_map', self.on_get_map)
 
         self.map_msg = self.load_map(map_yaml)
         self.inflated_map_msg = self.load_map(inflated_map_yaml)
-        self.cloud_msg = self.load_cloud(obstacle_pcd)
         metadata = {
             'map_yaml': map_yaml,
             'inflated_map_yaml': inflated_map_yaml,
-            'obstacle_pcd': obstacle_pcd,
             'frame_id': self.frame_id,
             'map_to_odom': [self.tx, self.ty, self.tz, self.yaw],
             'alignment_valid': self.alignment_valid,
             'occupancy_cells': len(self.map_msg.data),
-            'obstacle_points': self.cloud_msg.width,
         }
         if preparation is not None:
             metadata['preparation'] = preparation
@@ -184,9 +151,9 @@ class StaticNavigationMap(Node):
         self.initial_timer = self.create_timer(0.2, self.publish_initial)
         self.initial_sent = False
         self.get_logger().info(
-            'static navigation map loaded: %dx%d, %d obstacle points, frame=%s' % (
+            'static navigation map loaded: %dx%d, frame=%s' % (
                 self.map_msg.info.width, self.map_msg.info.height,
-                self.cloud_msg.width, self.frame_id))
+                self.frame_id))
 
     def transform_xy(self, x, y):
         c, s = math.cos(self.yaw), math.sin(self.yaw)
@@ -227,45 +194,17 @@ class StaticNavigationMap(Node):
         msg.data = values.ravel().tolist()
         return msg
 
-    def load_cloud(self, pcd_path):
-        points = read_ascii_pcd(pcd_path)
-        if len(points):
-            c, s = math.cos(self.yaw), math.sin(self.yaw)
-            x = points[:, 0].copy()
-            y = points[:, 1].copy()
-            points[:, 0] = c * x - s * y + self.tx
-            points[:, 1] = s * x + c * y + self.ty
-            points[:, 2] += self.tz
-        points = np.ascontiguousarray(points.astype('<f4', copy=False))
-        msg = PointCloud2()
-        msg.header.frame_id = self.frame_id
-        msg.height = 1
-        msg.width = len(points)
-        msg.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        msg.is_bigendian = False
-        msg.point_step = 12
-        msg.row_step = msg.point_step * msg.width
-        msg.data = points.tobytes()
-        msg.is_dense = True
-        return msg
-
     def stamp_messages(self):
         stamp = self.get_clock().now().to_msg()
         self.map_msg.header.stamp = stamp
         self.map_msg.info.map_load_time = stamp
         self.inflated_map_msg.header.stamp = stamp
         self.inflated_map_msg.info.map_load_time = stamp
-        self.cloud_msg.header.stamp = stamp
 
     def publish(self):
         self.stamp_messages()
         self.map_pub.publish(self.map_msg)
         self.inflated_map_pub.publish(self.inflated_map_msg)
-        self.cloud_pub.publish(self.cloud_msg)
         self.metadata_pub.publish(self.metadata_msg)
 
     def publish_initial(self):

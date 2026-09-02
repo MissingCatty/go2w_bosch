@@ -1,0 +1,50 @@
+{
+  "auto_start": false,
+  "database_path": "/home/unitree/go2_slam_ws/maps/remembr/remembr.sqlite3",
+  "capture": {
+    "sample_interval_s": 1.0,
+    "segment_duration_s": 3.0,
+    "frames_per_segment": 6,
+    "max_caption_chars": 3000,
+    "prompt": "请用中文概括机器人这段连续视野中的地点、物体、标志文字、人员和可用于之后返回这里的稳定视觉特征。只描述可见事实，不推测不可见内容。"
+  },
+  "vlm": {
+    "backend": "disabled",
+    "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+    "model": "",
+    "timeout_s": 90,
+    "api_key_env": "",
+    "health_endpoint": "",
+    "max_tokens": 384,
+    "temperature": 0.1,
+    "extra_body": {}
+  },
+  "embedding": {
+    "backend": "hash",
+    "dimensions": 256,
+    "model": "hash-char-v1",
+    "endpoint": "http://127.0.0.1:8000/v1/embeddings",
+    "timeout_s": 20,
+    "api_key_env": ""
+  },
+  "reasoner": {
+    "backend": "retrieval_only",
+    "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+    "model": "",
+    "timeout_s": 30,
+    "api_key_env": "",
+    "max_tokens": 64,
+    "extra_body": {}
+  },
+  "deduplication": {
+    "enabled": true,
+    "position_radius_m": 0.35,
+    "z_tolerance_m": 0.3,
+    "yaw_tolerance_deg": 20.0
+  },
+  "query": {
+    "default_limit": 5,
+    "max_limit": 20,
+    "max_scan": 50000
+  }
+}

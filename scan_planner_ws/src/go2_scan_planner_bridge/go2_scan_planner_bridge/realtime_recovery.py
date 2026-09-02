@@ -3,9 +3,10 @@
 
 SCAN remains the normal local planner.  This node is allowed to command a
 short recovery primitive only while SCAN explicitly reports WAIT_REPLAN.  It
-forward-simulates left/right strafe, reverse and in-place rotation against the
-latest deskewed cloud and the immutable inflated navigation grid.  If no
-candidate is completely checked, it publishes zero and waits.
+forward-simulates left/right strafe, reverse and in-place rotation only against
+the latest deskewed cloud.  The global path biases progress direction but no
+saved map, static cloud or static occupancy grid participates in collision
+checking.  If no candidate is completely checked, it publishes zero and waits.
 """
 
 from dataclasses import dataclass
@@ -16,15 +17,9 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-    qos_profile_sensor_data,
-)
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Bool, String
 
@@ -131,14 +126,13 @@ def footprint_metrics(points_xy, pose, radius, offset):
 
 
 def evaluate_primitive(points_xy, start, primitive, radius, offset,
-                       static_is_free, desired_direction):
+                       desired_direction):
     """Check the complete swept footprint, including safe overlap escape.
 
     A conservative footprint may already overlap at t=0.  Such a primitive is
     accepted only when overlap never increases, clearance never materially
-    worsens, it becomes fully clear before the end, and the static grid is free
-    at every pose.  This permits moving away from a contact margin without
-    granting a general collision exemption.
+    worsens, and it becomes fully clear before the end.  This permits moving
+    away from a contact margin without granting a general collision exemption.
     """
     poses = simulate_primitive(start, primitive)
     metrics = [footprint_metrics(points_xy, pose, radius, offset)
@@ -149,11 +143,7 @@ def evaluate_primitive(points_xy, start, primitive, radius, offset,
     previous_clearance = start_clearance
     min_clearance = start_clearance
     clearance_sum = 0.0
-    for index, (pose, (collisions, clearance)) in enumerate(zip(poses, metrics)):
-        if not static_is_free(pose[0], pose[1]):
-            return Evaluation(primitive, False, -math.inf, start_count,
-                              collisions, min(min_clearance, clearance),
-                              clearance, 0.0, 'static grid blocked')
+    for index, (_pose, (collisions, clearance)) in enumerate(zip(poses, metrics)):
         min_clearance = min(min_clearance, clearance)
         clearance_sum += min(0.8, clearance)
         if start_count == 0:
@@ -208,6 +198,8 @@ class RealtimeRecovery(Node):
             'activation_clearance', 0.45).value)
         self.activation_delay = float(self.declare_parameter(
             'activation_delay', 1.0).value)
+        self.cloud_topic = str(self.declare_parameter(
+            'cloud_topic', '/scan_planner/local_cloud').value)
         self.cloud_timeout = float(self.declare_parameter(
             'cloud_timeout', 0.35).value)
         self.pose_timeout = float(self.declare_parameter(
@@ -250,7 +242,6 @@ class RealtimeRecovery(Node):
         self.cloud_t = None
         self.cloud_input_t = None
         self._cloud_sub = None
-        self.static_map = None
         self.global_path = []
         self.local_waiting = False
         self.waiting_since = None
@@ -263,10 +254,6 @@ class RealtimeRecovery(Node):
         self.attempts = 0
         self.last_reason = '等待导航'
 
-        transient_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST, depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.command_pub = self.create_publisher(
             Twist, '/scan_planner/recovery_cmd', 10)
         self.active_pub = self.create_publisher(
@@ -279,9 +266,6 @@ class RealtimeRecovery(Node):
         self.create_subscription(
             Odometry, '/scan_planner/sensor_pose', self.on_sensor_pose,
             qos_profile_sensor_data)
-        self.create_subscription(
-            OccupancyGrid, '/navigation/inflated_map', self.on_map,
-            transient_qos)
         self.create_subscription(
             Path, '/scan_planner/global_path', self.on_path, 10)
         self.create_subscription(
@@ -308,7 +292,7 @@ class RealtimeRecovery(Node):
     def set_cloud_subscription(self, enabled):
         if enabled and self._cloud_sub is None:
             self._cloud_sub = self.create_subscription(
-                PointCloud2, '/lio_sam/deskew/cloud_deskewed', self.on_cloud,
+                PointCloud2, self.cloud_topic, self.on_cloud,
                 qos_profile_sensor_data)
         elif not enabled and self._cloud_sub is not None:
             self.destroy_subscription(self._cloud_sub)
@@ -349,19 +333,6 @@ class RealtimeRecovery(Node):
         self.cloud_points = world
         self.cloud_t = time.monotonic()
 
-    def on_map(self, message):
-        q = message.info.origin.orientation
-        self.static_map = {
-            'data': np.asarray(message.data, dtype=np.int8).reshape(
-                int(message.info.height), int(message.info.width)),
-            'width': int(message.info.width),
-            'height': int(message.info.height),
-            'resolution': float(message.info.resolution),
-            'origin_x': float(message.info.origin.position.x),
-            'origin_y': float(message.info.origin.position.y),
-            'yaw': quaternion_yaw(q),
-        }
-
     def on_path(self, message):
         self.global_path = [
             (float(item.pose.position.x), float(item.pose.position.y))
@@ -387,21 +358,6 @@ class RealtimeRecovery(Node):
         self.set_cloud_subscription(self.local_waiting and not self.cancelled)
         if self.cancelled:
             self.stop('导航已取消')
-
-    def static_is_free(self, x, y):
-        grid = self.static_map
-        if grid is None:
-            return False
-        dx = x - grid['origin_x']
-        dy = y - grid['origin_y']
-        c, s = math.cos(grid['yaw']), math.sin(grid['yaw'])
-        local_x = c * dx + s * dy
-        local_y = -s * dx + c * dy
-        ix = int(math.floor(local_x / grid['resolution']))
-        iy = int(math.floor(local_y / grid['resolution']))
-        if ix < 0 or iy < 0 or ix >= grid['width'] or iy >= grid['height']:
-            return False
-        return int(grid['data'][iy, ix]) == 0
 
     def desired_direction(self):
         pose = self.body_pose
@@ -439,8 +395,7 @@ class RealtimeRecovery(Node):
         start = (self.body_pose[0], self.body_pose[1], self.body_pose[3])
         return evaluate_primitive(
             self.obstacle_points_xy(), start, primitive,
-            self.radius, self.offset, self.static_is_free,
-            self.desired_direction())
+            self.radius, self.offset, self.desired_direction())
 
     def select_primitive(self):
         evaluations = [self.evaluate(item) for item in self.primitives]
@@ -486,10 +441,6 @@ class RealtimeRecovery(Node):
         if (self.cloud_t is None or now - self.cloud_t > self.cloud_timeout):
             self.stop('恢复保持零速：实时点云超时')
             return
-        if self.static_map is None:
-            self.stop('恢复保持零速：静态约束地图未就绪')
-            return
-
         if self.active:
             elapsed = now - self.active_started
             remaining = self.active_primitive.duration - elapsed

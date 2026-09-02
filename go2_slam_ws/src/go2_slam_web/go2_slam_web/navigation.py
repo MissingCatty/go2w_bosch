@@ -13,6 +13,12 @@ import uuid
 import numpy as np
 from scipy import ndimage, sparse
 from scipy.sparse import csgraph
+from scipy.spatial import cKDTree
+
+try:
+    import cv2
+except ImportError:  # The camera remains usable if OpenCV is absent.
+    cv2 = None
 
 
 NAV_DIR = '/home/unitree/go2_slam_ws/maps/navigation'
@@ -25,6 +31,7 @@ CAMERA_EXE = ('/home/unitree/go2_slam_ws/install/go2_imu_bridge/lib/'
 CAMERA_FILE = '/tmp/go2_front_camera_web.jpg'
 SCAN_START = '/home/unitree/scan_planner_ws/start_go2w_dry.sh'
 SCAN_STOP = '/home/unitree/scan_planner_ws/stop_go2w.sh'
+LIO_NAV_RESTORE = '/home/unitree/go2_slam_ws/restore_lio_sam_navigation.sh'
 
 # SCAN checks a pair of inflated cylinders rather than a single circular
 # footprint.  The PGM is inflated by the matching 0.23 m cylinder radius; Web
@@ -45,10 +52,19 @@ FOOTPRINT_ASTAR_YIELD_INTERVAL = 2048
 # 1.25 caps the intended path-cost tradeoff while avoiding multi-second plateaus.
 FOOTPRINT_HEURISTIC_WEIGHT = 1.25
 # The saved grid already contains the 0.23 m hard body-radius inflation.  This
-# additional band is deliberately a soft cost: open corridors prefer their
-# centre, while a narrow but collision-free passage remains traversable.
-GLOBAL_CLEARANCE_SOFT_M = 0.30
-GLOBAL_CLEARANCE_WEIGHT = 1.20
+# additional band is deliberately a soft cost: open corridors strongly prefer
+# their centre, while a narrow but collision-free passage remains traversable.
+# This distance is measured outside the already radius-inflated hard grid.
+GLOBAL_CLEARANCE_SOFT_M = 0.80
+GLOBAL_CLEARANCE_WEIGHT = 4.00
+# If map drift puts the physical robot inside a saved static obstacle, do not
+# falsify the static map or let global A* start inside a wall. Pick a nearby
+# entry point that is free in both the saved grid and the current live layer;
+# SCAN then reaches that entry using live lidar only.
+TEMP_START_MIN_RADIUS_M = 0.30
+TEMP_START_MAX_RADIUS_M = 2.00
+TEMP_START_OPEN_CLEARANCE_M = 0.20
+TEMP_START_LIVE_MAX_AGE_S = 1.00
 
 
 class FootprintSearchTimeout(RuntimeError):
@@ -160,14 +176,46 @@ class CameraBridge:
                 pass
 
     def image(self):
+        sample = self.sample(include_fingerprint=False)
+        return sample['data'] if sample is not None else None
+
+    @staticmethod
+    def _fingerprint(data):
+        """Return a compact perceptual dHash without retaining image pixels."""
+        if cv2 is None:
+            return None
         try:
-            age = time.time() - os.path.getmtime(CAMERA_FILE)
-            if age > 2.5:
+            encoded = np.frombuffer(data, dtype=np.uint8)
+            gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
                 return None
+            thumb = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+            differences = (thumb[:, 1:] > thumb[:, :-1]).reshape(-1)
+            fingerprint = 0
+            for different in differences:
+                fingerprint = (fingerprint << 1) | int(bool(different))
+            return fingerprint
+        except Exception:
+            return None
+
+    def sample(self, include_fingerprint=True):
+        """Return one fresh atomic JPEG plus a token for frame deduplication."""
+        try:
             with open(CAMERA_FILE, 'rb') as stream:
+                stat = os.fstat(stream.fileno())
+                age = time.time() - stat.st_mtime
+                if age > 2.5:
+                    return None
                 data = stream.read()
             if len(data) > 4 and data[:2] == b'\xff\xd8':
-                return data
+                sample = {
+                    'data': data,
+                    'observed_at': stat.st_mtime,
+                    'token': (stat.st_mtime_ns, stat.st_size),
+                }
+                if include_fingerprint:
+                    sample['fingerprint'] = self._fingerprint(data)
+                return sample
         except (FileNotFoundError, OSError):
             pass
         return None
@@ -208,11 +256,27 @@ class NavigationState:
         self.global_progress = 0
         self.local = []
         self.local_t = 0.0
+        # SCAN's live collision map is kept in map coordinates for direct
+        # browser rendering.  The planner still consumes its full-resolution
+        # GridMap; these arrays are visualization-only, bounded samples.
+        self.obstacle_raw = np.empty((0, 3), np.float32)
+        self.obstacle_raw_t = 0.0
+        self.obstacle_raw_source_count = 0
+        self.obstacle_inflated = np.empty((0, 3), np.float32)
+        self.obstacle_inflated_t = 0.0
+        self.obstacle_inflated_source_count = 0
+        # Full live inflated cloud retained for one-shot temporary-start
+        # selection. The browser still receives only obstacle_inflated's
+        # bounded sample, so this does not increase WebSocket bandwidth.
+        self.obstacle_inflated_planning = np.empty((0, 3), np.float32)
+        self.local_horizon = None
+        self.local_horizon_t = 0.0
         self.local_waiting = False
         self.local_waiting_t = 0.0
         self.recovery_status = {
             'active': False, 'action': None, 'reason': '等待导航'}
         self.goal = None
+        self.temporary_start = None
         self.route_message = '等待设置目标点'
         self.chassis_enable_callback = None
         self.meta = {}
@@ -386,6 +450,40 @@ class NavigationState:
         with self.lock:
             return bool(self.alignment_valid)
 
+    def memory_map_snapshot(self):
+        """Return the immutable identity used to isolate semantic memories."""
+        with self.lock:
+            if not self.map_signature:
+                return None, '导航基准图尚未加载'
+            return {
+                'map_signature': self.map_signature,
+                'map_source': os.path.basename(self.meta.get('source', '')),
+                'navigation_session_id': self.navigation_session_id,
+            }, ''
+
+    def memory_pose_snapshot(self, max_age=1.0):
+        """Return a fresh, map-aligned pose or fail closed for memory capture."""
+        with self.lock:
+            if not self.enabled:
+                return None, '当前不在导航模式'
+            if not self.alignment_valid:
+                return None, self.alignment_reason or '地图位姿尚未标定'
+            now = time.time()
+            age = now - self.pose_t if self.pose_t else None
+            if age is None or age > float(max_age):
+                return None, '地图位姿数据过期'
+            pose = {
+                'x': float(self.pose['x']),
+                'y': float(self.pose['y']),
+                'z': float(self.pose['z']),
+                'yaw': float(self.pose['yaw']),
+                'observed_at': float(self.pose_t),
+                'map_signature': self.map_signature,
+                'map_source': os.path.basename(self.meta.get('source', '')),
+                'navigation_session_id': self.navigation_session_id,
+            }
+            return pose, ''
+
     def alignment_status(self):
         with self.lock:
             result = {
@@ -401,6 +499,26 @@ class NavigationState:
                 result['method'] = self.alignment_data.get('method', 'manual')
                 result['quality'] = dict(self.alignment_data.get('quality', {}))
             return result
+
+    def nav2_map_to_odom_tf(self):
+        """Return the standard ROS ``nav_map -> odom`` TF transform.
+
+        ``map_to_odom`` is the historical planner transform and evaluates
+        ``p_odom = T_odom_map * p_map``.  A ROS TF whose parent is ``nav_map``
+        and child is ``odom`` stores the inverse transform, so do that inversion
+        in one tested owner rather than duplicating it in launch-side bridges.
+        """
+        with self.lock:
+            if not self.alignment_valid:
+                return None
+            tx, ty, yaw = self.map_to_odom
+        c, s = math.cos(yaw), math.sin(yaw)
+        return {
+            'x': -c * tx - s * ty,
+            'y': s * tx - c * ty,
+            'z': 0.0,
+            'yaw': self._wrap_angle(-yaw),
+        }
 
     def set_alignment(self, map_x, map_y, map_yaw, method='manual', quality=None,
                       rough_pose=None):
@@ -463,6 +581,7 @@ class NavigationState:
             self.local_waiting = False
             self.local_waiting_t = 0.0
             self.goal = None
+            self.temporary_start = None
             self.route_message = '位姿已标定，请确认地图中机器人位置和朝向'
             self._refresh_map_pose_locked()
         return True, '位姿标定已保存'
@@ -496,6 +615,7 @@ class NavigationState:
         self.local_waiting = False
         self.local_waiting_t = 0.0
         self.goal = None
+        self.temporary_start = None
         self.route_message = str(reason)
 
     def _refresh_map_pose_locked(self):
@@ -548,6 +668,7 @@ class NavigationState:
                 self.local_waiting = False
                 self.local_waiting_t = 0.0
                 self.goal = None
+                self.temporary_start = None
                 self.route_message = '等待设置目标点'
 
     def update_pose(self, msg, rpy):
@@ -569,15 +690,26 @@ class NavigationState:
                 position_jump = math.hypot(
                     float(p.x) - previous_odom['x'],
                     float(p.y) - previous_odom['y'])
+                # LIO-SAM normally publishes only about 4--5 Hz and can leave
+                # a much longer gap while its graph is busy. At the physical
+                # 0.8 m/s ceiling, a valid update after such a gap can exceed
+                # the old fixed 0.50 m threshold. Scale the discontinuity gate
+                # with elapsed time while retaining a hard upper bound for a
+                # genuine odom-frame reset.
+                position_jump_limit = min(
+                    1.25, max(0.50, 0.20 + 1.20 * dt))
                 # At the physical gate limits a valid sample-to-sample motion
                 # is only a few centimetres/degrees.  A much larger discontinuity
                 # means LIO changed its odom frame (for example after a graph
                 # correction or an IMU outage), so the persisted map transform
                 # is no longer meaningful even though Linux did not reboot.
-                if position_jump > 0.50 or abs(yaw_delta) > math.radians(45.0):
+                if (position_jump > position_jump_limit or
+                        abs(yaw_delta) > math.radians(45.0)):
                     alignment_jump_reason = (
-                        '检测到LIO坐标系跳变 %.2f m / %.1f°，需重新自动定位' % (
-                            position_jump, math.degrees(abs(yaw_delta))))
+                        '检测到LIO坐标系跳变 %.2f m / %.1f° '
+                        '(帧间隔 %.2fs，位移上限 %.2fm)，需重新自动定位' % (
+                            position_jump, math.degrees(abs(yaw_delta)),
+                            dt, position_jump_limit))
                     self._invalidate_alignment_locked(alignment_jump_reason)
                     alignment_callback = self.chassis_enable_callback
             self.odom_pose = {
@@ -652,6 +784,74 @@ class NavigationState:
             self.local = points
             self.local_t = time.time()
 
+    def update_obstacle_cloud(self, points, inflated, source_count,
+                              planning_points=None):
+        """Store a bounded SCAN occupancy sample in the static-map frame."""
+        cloud = np.asarray(points, dtype=np.float32)
+        if cloud.ndim != 2 or cloud.shape[1] < 3:
+            return
+        cloud = cloud[:, :3].copy()
+        planning_cloud = None
+        if inflated:
+            source = points if planning_points is None else planning_points
+            planning_cloud = np.asarray(source, dtype=np.float32)
+            if planning_cloud.ndim != 2 or planning_cloud.shape[1] < 3:
+                return
+            planning_cloud = planning_cloud[:, :3].copy()
+        now = time.time()
+        with self.lock:
+            if not self.alignment_valid:
+                if inflated:
+                    self.obstacle_inflated = np.empty((0, 3), np.float32)
+                    self.obstacle_inflated_t = 0.0
+                    self.obstacle_inflated_source_count = 0
+                    self.obstacle_inflated_planning = np.empty((0, 3), np.float32)
+                else:
+                    self.obstacle_raw = np.empty((0, 3), np.float32)
+                    self.obstacle_raw_t = 0.0
+                    self.obstacle_raw_source_count = 0
+                return
+            tx, ty, yaw = self.map_to_odom
+            c, s = math.cos(yaw), math.sin(yaw)
+            dx = cloud[:, 0] - tx
+            dy = cloud[:, 1] - ty
+            cloud[:, 0] = c * dx + s * dy
+            cloud[:, 1] = -s * dx + c * dy
+            if inflated:
+                planning_dx = planning_cloud[:, 0] - tx
+                planning_dy = planning_cloud[:, 1] - ty
+                planning_cloud[:, 0] = c * planning_dx + s * planning_dy
+                planning_cloud[:, 1] = -s * planning_dx + c * planning_dy
+                self.obstacle_inflated = cloud
+                self.obstacle_inflated_planning = planning_cloud
+                self.obstacle_inflated_t = now
+                self.obstacle_inflated_source_count = int(source_count)
+            else:
+                self.obstacle_raw = cloud
+                self.obstacle_raw_t = now
+                self.obstacle_raw_source_count = int(source_count)
+
+    def update_local_horizon(self, msg):
+        """Track the exact start/target pair used by the current SCAN attempt."""
+        if len(msg.poses) < 2:
+            with self.lock:
+                self.local_horizon = None
+                self.local_horizon_t = 0.0
+            return
+        with self.lock:
+            if not self.alignment_valid:
+                self.local_horizon = None
+                self.local_horizon_t = 0.0
+                return
+            transform = self.map_to_odom
+            horizon = []
+            for stamped in msg.poses[:2]:
+                point = stamped.pose.position
+                x, y = self._odom_to_map_xy(point.x, point.y, transform)
+                horizon.append((x, y, float(point.z)))
+            self.local_horizon = horizon
+            self.local_horizon_t = time.time()
+
     def update_local_waiting(self, msg):
         """Track SCAN's persistent wait/retry state for the browser."""
         with self.lock:
@@ -682,9 +882,12 @@ class NavigationState:
             self.global_progress = 0
             self.local = []
             self.local_t = 0.0
+            self.local_horizon = None
+            self.local_horizon_t = 0.0
             self.local_waiting = False
             self.local_waiting_t = 0.0
             self.goal = None
+            self.temporary_start = None
             self.route_message = message
 
     def has_active_goal(self):
@@ -692,12 +895,20 @@ class NavigationState:
             return self.goal is not None
 
     def snapshot(self, camera_status, planner_active, chassis_status=None,
-                 with_paths=True):
+                 with_paths=True, with_obstacles=True):
         with self.lock:
             now = time.time()
             pose_age = now - self.pose_t if self.pose_t else None
             low_age = now - self.lowstate_t if self.lowstate_t else None
             local_age = now - self.local_t if self.local_t else None
+            raw_age = now - self.obstacle_raw_t if self.obstacle_raw_t else None
+            inflated_age = (now - self.obstacle_inflated_t
+                            if self.obstacle_inflated_t else None)
+            horizon_age = now - self.local_horizon_t if self.local_horizon_t else None
+            raw_online = raw_age is not None and raw_age < 1.5
+            inflated_online = inflated_age is not None and inflated_age < 1.5
+            horizon_online = (horizon_age is not None and horizon_age < 1.5 and
+                              self.local_horizon is not None and self.goal is not None)
             remaining = self.global_dense[self.global_progress:]
             route_message = self.route_message
             recovery = dict(self.recovery_status)
@@ -713,7 +924,36 @@ class NavigationState:
                 'global_path': _flat(remaining) if with_paths else None,
                 'local_path': (_flat(self.local) if local_age is not None and local_age < 2.0 else [])
                 if with_paths else None,
+                'local_obstacles': {
+                    'raw': (_flat(self.obstacle_raw) if with_obstacles and raw_online else
+                            ([] if with_obstacles else None)),
+                    'inflated': (_flat(self.obstacle_inflated)
+                                 if with_obstacles and inflated_online else
+                                 ([] if with_obstacles else None)),
+                    'raw_sample_count': int(len(self.obstacle_raw)) if raw_online else 0,
+                    'raw_source_count': (self.obstacle_raw_source_count
+                                         if raw_online else 0),
+                    'raw_age': None if raw_age is None else round(raw_age, 2),
+                    'raw_online': raw_online,
+                    'inflated_sample_count': (int(len(self.obstacle_inflated))
+                                              if inflated_online else 0),
+                    'inflated_source_count': (self.obstacle_inflated_source_count
+                                              if inflated_online else 0),
+                    'inflated_age': (None if inflated_age is None else
+                                     round(inflated_age, 2)),
+                    'inflated_online': inflated_online,
+                    'start': (_flat([self.local_horizon[0]])
+                              if horizon_online else None),
+                    'target': (_flat([self.local_horizon[1]])
+                               if horizon_online else None),
+                    'horizon_age': (None if horizon_age is None else
+                                    round(horizon_age, 2)),
+                    'horizon_online': horizon_online,
+                    'sampled_for_web': True,
+                },
                 'goal': self.goal,
+                'temporary_start': (None if self.temporary_start is None else
+                                    dict(self.temporary_start)),
                 'route_message': route_message,
                 'state': dict(self.lowstate),
                 'health': {
@@ -745,13 +985,15 @@ class NavigationState:
         return result
 
     def validate_alignment_pose(self, x, y):
-        """Require the localized base center to lie on the inflated free grid."""
+        """Accept a map-error start only when a nearby static exit exists."""
         cell = self._to_cell(float(x), float(y))
         height, width = self.free.shape
         if not (0 <= cell[0] < width and 0 <= cell[1] < height):
             return False, '自动定位结果超出导航地图'
         if not self.free[cell[1], cell[0]]:
-            return False, '自动定位结果落在障碍物膨胀区，已拒绝'
+            if self._temporary_start_candidates((float(x), float(y))) is None:
+                return False, '自动定位结果位于静态障碍内，且附近没有可用临时起点'
+            return True, '自动定位结果位于静态障碍内，规划时将使用临时起点'
         return True, ''
 
     def _to_cell(self, x, y):
@@ -785,6 +1027,98 @@ class NavigationState:
         choices = np.flatnonzero(inside)
         best = choices[int(np.argmin(distance2[inside]))]
         return int(xs[best]), int(ys[best])
+
+    def _temporary_start_candidates(self, start_xy):
+        """Return saved-grid free cells in the configured escape annulus."""
+        centre = self._to_cell(*start_xy)
+        height, width = self.free.shape
+        radius = int(math.ceil(TEMP_START_MAX_RADIUS_M / self.resolution))
+        x0, x1 = max(0, centre[0] - radius), min(width - 1, centre[0] + radius)
+        y0, y1 = max(0, centre[1] - radius), min(height - 1, centre[1] + radius)
+        if x0 > x1 or y0 > y1:
+            return None
+        ys, xs = np.nonzero(self.free[y0:y1 + 1, x0:x1 + 1])
+        if not len(xs):
+            return None
+        xs = xs + x0
+        ys = ys + y0
+        wx = self.origin[0] + (xs.astype(np.float64) + 0.5) * self.resolution
+        wy = self.origin[1] + (ys.astype(np.float64) + 0.5) * self.resolution
+        distances = np.hypot(wx - start_xy[0], wy - start_xy[1])
+        keep = ((distances >= TEMP_START_MIN_RADIUS_M) &
+                (distances <= TEMP_START_MAX_RADIUS_M))
+        if not keep.any():
+            return None
+        return (xs[keep], ys[keep], wx[keep], wy[keep], distances[keep])
+
+    def _select_temporary_start(self, start_xy, raw_goal, live_inflated):
+        """Select a live-clear static entry point that can reach the goal."""
+        candidates = self._temporary_start_candidates(start_xy)
+        if candidates is None:
+            return None
+        xs, ys, wx, wy, distances = candidates
+        components = self.free_components[ys, xs]
+
+        # Only retain static components onto which the requested target can be
+        # snapped. This avoids escaping into a small free island that cannot
+        # participate in the requested global route.
+        goals = {}
+        for component in np.unique(components):
+            component = int(component)
+            if component > 0:
+                goal = self._nearest_free(raw_goal, component=component)
+                if goal is not None:
+                    goals[component] = goal
+        if not goals:
+            return None
+        viable = np.fromiter(
+            (int(component) in goals for component in components),
+            dtype=np.bool_, count=len(components))
+
+        live_xy = np.asarray(live_inflated, dtype=np.float32)
+        if live_xy.ndim != 2 or live_xy.shape[1] < 2:
+            return None
+        if len(live_xy):
+            live_distances, _ = cKDTree(live_xy[:, :2]).query(
+                np.column_stack((wx, wy)), k=1)
+        else:
+            live_distances = np.full(len(wx), np.inf, dtype=np.float64)
+        # occupancy_inflate is a voxel-centre cloud that is already expanded
+        # by SCAN's collision radius. Half a cell diagonal distinguishes a
+        # genuinely different free cell without adding another large radius.
+        live_hard_clearance = self.resolution * 0.75
+        viable &= live_distances > live_hard_clearance
+        choices = np.flatnonzero(viable)
+        if not len(choices):
+            return None
+
+        static_clearance = self.clearance_m[ys, xs].astype(np.float64)
+        combined_clearance = np.minimum(static_clearance, live_distances)
+        open_choices = choices[
+            combined_clearance[choices] >= TEMP_START_OPEN_CLEARANCE_M]
+        if len(open_choices):
+            # Once the requested openness is met, prefer the closest point so
+            # a map error does not create an unnecessarily long escape leg.
+            score = (distances[open_choices] -
+                     0.10 * np.minimum(combined_clearance[open_choices], 0.8))
+            best = int(open_choices[int(np.argmin(score))])
+        else:
+            # A narrow corridor may not contain 20 cm of extra clearance.
+            # Retain generality by choosing the best available clearance while
+            # still penalizing a needlessly distant point.
+            score = (2.0 * np.minimum(combined_clearance[choices], 0.8) -
+                     0.75 * distances[choices])
+            best = int(choices[int(np.argmax(score))])
+
+        component = int(components[best])
+        return {
+            'cell': (int(xs[best]), int(ys[best])),
+            'goal': goals[component],
+            'world': (float(wx[best]), float(wy[best])),
+            'distance': float(distances[best]),
+            'static_clearance': float(static_clearance[best]),
+            'live_clearance': float(live_distances[best]),
+        }
 
     def _goal_on_start_component(self, raw_goal, start):
         component = int(self.free_components[start[1], start[0]])
@@ -1192,13 +1526,27 @@ class NavigationState:
             if not self.pose_t or time.time() - self.pose_t > 1.0:
                 return False, '导航位姿离线，无法规划', None
             start_xy = (self.pose['x'], self.pose['y'])
+            live_inflated = self.obstacle_inflated_planning.copy()
+            live_age = (time.time() - self.obstacle_inflated_t
+                        if self.obstacle_inflated_t else None)
         raw_start = self._to_cell(*start_xy)
         start = self._nearest_free(raw_start, max_distance=0.15)
         raw_goal = self._to_cell(float(goal_x), float(goal_y))
+        temporary = None
         if start is None:
-            return False, '机器狗中心落在静态膨胀障碍区', None
-        component = int(self.free_components[start[1], start[0]])
-        goal = self._nearest_free(raw_goal, component=component)
+            if live_age is None or live_age > TEMP_START_LIVE_MAX_AGE_S:
+                return False, '机器狗位于静态障碍内，但实时膨胀障碍层尚未就绪', None
+            temporary = self._select_temporary_start(
+                start_xy, raw_goal, live_inflated)
+            if temporary is None:
+                return False, (
+                    '机器狗位于静态障碍内；%.1fm 内没有同时避开静态和实时障碍、'
+                    '且可连接目标的临时起点' % TEMP_START_MAX_RADIUS_M), None
+            start = temporary['cell']
+            goal = temporary['goal']
+        else:
+            component = int(self.free_components[start[1], start[0]])
+            goal = self._nearest_free(raw_goal, component=component)
         if goal is None:
             if self._nearest_free(raw_goal) is not None:
                 return False, '目标与机器狗不在同一静态自由区域', None
@@ -1213,7 +1561,13 @@ class NavigationState:
             return False, '静态自由区内没有连接该目标的路线', None
         waypoint_cells = self._simplify(cells)
         waypoints_xy = [self._to_world(cell) for cell in waypoint_cells]
-        dense = self._densify(waypoints_xy)
+        # The published reference starts at the selected static entry point;
+        # SCAN connects the physical pose to it using live lidar. For Web
+        # rendering only, include the current pose so that escape progress is
+        # visible before the static global route begins.
+        display_waypoints = ([start_xy] + waypoints_xy
+                             if temporary is not None else waypoints_xy)
+        dense = self._densify(display_waypoints)
         adjusted_goal = self._to_world(goal)
         with self.lock:
             self.global_waypoints = [(x, y, 0.0) for x, y in waypoints_xy]
@@ -1223,9 +1577,30 @@ class NavigationState:
             self.local_waiting = False
             self.local_waiting_t = 0.0
             self.goal = {'x': round(adjusted_goal[0], 3), 'y': round(adjusted_goal[1], 3)}
-            distance = sum(math.hypot(b[0] - a[0], b[1] - a[1])
-                           for a, b in zip(waypoints_xy, waypoints_xy[1:]))
-            self.route_message = '全局路径 %.1f m · %d 个关键点' % (distance, len(waypoints_xy))
+            static_distance = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                                  for a, b in zip(waypoints_xy, waypoints_xy[1:]))
+            distance = static_distance
+            if temporary is not None:
+                distance += temporary['distance']
+                self.temporary_start = {
+                    'x': round(temporary['world'][0], 3),
+                    'y': round(temporary['world'][1], 3),
+                    'distance': round(temporary['distance'], 3),
+                    'static_clearance': round(temporary['static_clearance'], 3),
+                    'live_clearance': (None if not math.isfinite(
+                        temporary['live_clearance']) else
+                        round(temporary['live_clearance'], 3)),
+                }
+                self.route_message = (
+                    '临时起点 (%.2f, %.2f)，先用实时局部规划驶出 %.2f m · '
+                    '全局路径 %.1f m · %d 个关键点' % (
+                        temporary['world'][0], temporary['world'][1],
+                        temporary['distance'], static_distance,
+                        len(waypoints_xy)))
+            else:
+                self.temporary_start = None
+                self.route_message = '全局路径 %.1f m · %d 个关键点' % (
+                    distance, len(waypoints_xy))
             transform = self.map_to_odom
             published = [(*self._map_to_odom_xy(x, y, transform), z)
                          for x, y, z in self.global_waypoints]
@@ -1291,13 +1666,27 @@ class NavigationState:
 class OperationManager:
     """Global mapping/navigation/map-library mutual exclusion and lifecycle."""
 
-    def __init__(self, navigation, camera, save_callback, mapping_stream_callback):
+    def __init__(self, navigation, camera, save_callback, mapping_stream_callback,
+                 reset_mapping_callback):
         self.lock = threading.Lock()
         self.navigation = navigation
         self.camera = camera
         self.save_callback = save_callback
         self.mapping_stream_callback = mapping_stream_callback
-        self.mode = 'navigation' if self.planner_active(refresh=True) else 'mapping'
+        self.reset_mapping_callback = reset_mapping_callback
+        planner_running = self.planner_active(refresh=True)
+        front_mapping = subprocess.run(
+            ['systemctl', '--user', 'is-active', '--quiet',
+             'go2-front-pointlio.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        # A stale SCAN unit must never make a Web restart reinterpret the
+        # front-lidar mapping backend as navigation odometry.
+        if front_mapping and planner_running:
+            subprocess.run(
+                [SCAN_STOP], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=20.0)
+            planner_running = False
+        self.mode = 'navigation' if planner_running else 'mapping'
         self.mapping_active = False
         self._planner_active = self.mode == 'navigation'
         self._planner_checked = time.time()
@@ -1318,18 +1707,42 @@ class OperationManager:
         return self._planner_active
 
     @staticmethod
-    def _script(path):
+    def _script(path, timeout=20.0):
         result = subprocess.run([path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, timeout=20.0)
+                                text=True, timeout=timeout)
         return result.returncode == 0, result.stdout.strip()
 
+    def ensure_lio_navigation_backend(self):
+        """Navigation is allowed to consume only the XT16 LIO-SAM odometry."""
+        front_active = subprocess.run(
+            ['systemctl', '--user', 'is-active', '--quiet',
+             'go2-front-pointlio.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        lio_active = subprocess.run(
+            ['systemctl', '--user', 'is-active', '--quiet',
+             'go2-lio-sam.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        xt16_active = subprocess.run(
+            ['systemctl', '--user', 'is-active', '--quiet', 'go2-xt16.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if not front_active and lio_active and xt16_active:
+            return True, '导航定位使用 XT16 + LIO-SAM'
+        ok, output = self._script(LIO_NAV_RESTORE, timeout=120.0)
+        if ok:
+            return True, '导航定位后端已恢复为 XT16 + LIO-SAM'
+        lines = [line for line in output.splitlines() if line.strip()]
+        return False, (lines[-1] if lines else 'LIO-SAM 导航定位后端恢复失败')
+
     def ensure_navigation(self):
+        backend_ok, backend_message = self.ensure_lio_navigation_backend()
+        if not backend_ok:
+            return False, backend_message or 'LIO-SAM 导航定位后端恢复失败'
         if self.planner_active(refresh=True):
-            return True, 'SCAN-Planner 已运行'
+            return True, '%s；SCAN-Planner 已运行' % backend_message
         ok, output = self._script(SCAN_START)
         self.planner_active(refresh=True)
         running = ok and self._planner_active
-        return running, ('SCAN-Planner 干跑已启动' if running else
+        return running, (('%s；SCAN-Planner 干跑已启动' % backend_message) if running else
                          (output or 'SCAN-Planner 启动失败'))
 
     def stop_planner(self):
@@ -1361,12 +1774,40 @@ class OperationManager:
             self.mapping_active = False
             return True, message
 
+    def clear_mapping(self):
+        """Discard only the current live LIO map, preserving saved map files."""
+        with self.lock:
+            if self.mode != 'mapping':
+                return False, '当前不在建图页面'
+            if not self.mapping_active:
+                return False, '请先开始建图，再清除当前建图'
+
+            # Resetting odometry invalidates every motion reference.  Close the
+            # actuator gate even if global keyboard control was left enabled.
+            self.navigation.set_chassis_enabled(False)
+            # Unsubscribe before replacing the LIO process so a final message
+            # from the old process cannot repopulate the cleared Web snapshot.
+            self.mapping_stream_callback(False)
+            try:
+                ok, message = self.reset_mapping_callback()
+            except Exception as exc:
+                ok, message = False, '清除当前建图失败: %s' % exc
+            finally:
+                self.mapping_stream_callback(True)
+            return ok, message
+
     def switch(self, target, save_name=None, preserve_teleop=False):
         if target not in ('mapping', 'navigation', 'maps'):
             return False, '未知模式', self.mode
         with self.lock:
             if target == self.mode:
                 label = {'mapping': '建图', 'navigation': '导航', 'maps': '地图预览'}[target]
+                if target == 'navigation':
+                    backend_ok, backend_message = self.ensure_lio_navigation_backend()
+                    if not backend_ok:
+                        return False, ('导航定位后端校验失败: %s' %
+                                       (backend_message or '未知错误')), self.mode
+                    return True, '%s；已经在%s页面' % (backend_message, label), self.mode
                 return True, '已经在%s页面' % label, self.mode
 
             previous = self.mode
@@ -1405,9 +1846,14 @@ class OperationManager:
                     messages.append('全局键盘控制保持启用')
 
             if target == 'navigation':
+                backend_ok, backend_message = self.ensure_lio_navigation_backend()
+                if not backend_ok:
+                    return False, ('导航定位后端切换失败: %s' %
+                                   (backend_message or '未知错误')), self.mode
                 self.mode = 'navigation'
                 self.navigation.set_enabled(True)
                 self.mapping_stream_callback(False)
+                messages.append(backend_message)
                 messages.append('已进入导航页面；离线预演不会启动 SCAN 或摄像头')
                 return True, '；'.join(filter(None, messages)), self.mode
 

@@ -14,6 +14,9 @@ stop_exact_process() {
     fi
 }
 
+echo "==> 停止端侧 Qwen3.5 VLM"
+"$(cd "$(dirname "$0")" && pwd)/stop_remembr_vlm.sh" >/dev/null 2>&1
+
 echo "==> 停止 Humble LIO-SAM"
 systemctl --user --no-block stop go2-lio-sam.service 2>/dev/null
 docker stop -t 10 dddmr_humble >/dev/null 2>&1

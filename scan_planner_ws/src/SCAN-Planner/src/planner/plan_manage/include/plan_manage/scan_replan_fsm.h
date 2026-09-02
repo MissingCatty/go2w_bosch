@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <iostream>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -54,15 +55,19 @@ namespace scan_planner
 
     /* parameters */
     int navi_mode_; // 1 manual select, 2 hard code
-    double no_replan_thresh_, replan_thresh_;
+    double no_replan_thresh_;
     std::vector<Eigen::Vector3d> preset_waypoints_;
     int waypoint_num_;
     double planning_horizon_;
     double emergency_time_;
     double replan_retry_interval_;
+    double periodic_replan_interval_;
+    double collision_replan_horizon_;
+    double controller_velocity_timeout_;
     double goal_stop_speed_;
     double goal_arrival_tolerance_;
     double live_cloud_timeout_;
+    double reference_entry_tolerance_;
     int resume_clear_observations_;
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
@@ -76,6 +81,10 @@ namespace scan_planner
     bool rviz_height_ready_;
     bool go2_execution_frozen_;
     bool force_replan_from_odom_{false};
+    bool periodic_replan_attempt_{false};
+    bool periodic_replan_enabled_{true};
+    bool have_controller_velocity_{false};
+    bool staging_reference_entry_{false};
     bool enable_fail_safe_, need_hover_stop_;
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
@@ -85,8 +94,11 @@ namespace scan_planner
     uint64_t last_resume_observation_sequence_{0};
     rclcpp::Time last_freeze_update_time_;
     rclcpp::Time next_replan_time_;
+    rclcpp::Time next_periodic_replan_time_;
+    rclcpp::Time last_controller_velocity_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
+    Eigen::Vector3d controller_velocity_world_{Eigen::Vector3d::Zero()};
     Eigen::Quaterniond odom_orient_;
 
     Eigen::Vector3d init_pt_, start_pt_, start_vel_, start_acc_, start_yaw_; // start state
@@ -110,8 +122,10 @@ namespace scan_planner
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr go2_execution_frozen_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr replan_request_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr navigation_cancel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr controller_velocity_sub_;
     rclcpp::Publisher<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::DataDisp>::SharedPtr data_disp_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_horizon_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr self_inflation_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr navigation_completed_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr local_waiting_pub_;
@@ -126,6 +140,7 @@ namespace scan_planner
     void resetResumeConfirmation();
     void setStartStateFromOdomOrCurrentTraj();
     void replanRequestCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
+    bool useFreshControllerVelocity(Eigen::Vector3d &velocity);
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
@@ -156,6 +171,8 @@ namespace scan_planner
     void odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
     void go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
     void navigationCancelCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
+    void controllerVelocityCallback(
+        const geometry_msgs::msg::TwistStamped::ConstSharedPtr &msg);
 
     bool checkCollision();
 

@@ -2,6 +2,17 @@
 
 GO2-W（轮式）+ Pandar XT16 + 机身内置 IMU 的 ROS2 建图链路，提供浏览器实时地图、点云、位姿和三维地图保存。
 
+仓库已加入端侧语义记忆适配：复用前置相机和已对齐的 map 位姿，以轻量
+SQLite/WAL 保存描述和时空坐标，检索结果只生成需要人工确认的安全候选点。
+VLM 已适配本机 Qwen3.5-2B Q8_0 + Q8 视觉投影器 + llama.cpp CUDA 服务，自动采集
+默认仍关闭；硬件部署、配置和安全边界见
+[`REMEMBR_EDGE_INTEGRATION.md`](REMEMBR_EDGE_INTEGRATION.md)。
+
+导航侧已增加独立的 Humble Nav2 影子链：Smac State Lattice 全局规划、MPPI
+局部控制、分层 costmap、速度平滑、Collision Monitor 和有界恢复行为树。
+默认真实控制仍由 SCAN-Planner 独占，后端只能在底盘锁定时显式切换；架构、
+参数与分阶段验收见 [`NAV2_GO2W_INTEGRATION.md`](NAV2_GO2W_INTEGRATION.md)。
+
 ## 当前数据链路
 
 ```text
@@ -42,6 +53,19 @@ cd ~/go2_slam_ws
 
 # 同时重编所有导航组件
 ./start_navigation.sh --build
+
+# 单独管理 Nav2 影子链（默认不接管底盘）
+./build_nav2.sh
+./start_nav2_shadow.sh
+./stop_nav2_shadow.sh
+
+# 单独构建、启动或停止端侧 Qwen3.5-2B INT8 VLM
+./build_remembr_vlm.sh
+./start_remembr_vlm.sh
+./stop_remembr_vlm.sh
+
+# 交互式存入 DeepSeek Flash reasoner 密钥（不要把密钥发到聊天中）
+./configure_remembr_api.sh
 
 # 停止驱动、桥接、LIO-SAM 和 Web；不会删除 maps/
 ./stop.sh
@@ -193,6 +217,7 @@ docker logs -f dddmr_humble
 |---|---|---|
 | `/` | GET | 建图控制台 |
 | `/api/status` | GET | 位姿、频率、地图统计和健康状态 |
+| `/api/navigation/backend` | GET/POST | 查看或在底盘锁定时切换 SCAN/Nav2 后端 |
 | `/api/save` | POST | 保存当前三维全局地图 |
 | `/api/maps` | GET | 已保存地图列表 |
 | `/api/download?name=...` | GET | 下载地图 |

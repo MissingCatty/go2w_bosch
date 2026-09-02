@@ -37,7 +37,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, String
@@ -49,19 +49,26 @@ import tornado.web
 import tornado.websocket
 
 from go2_slam_core.fallback_slam import pointcloud2_to_xyz
+from go2_remembr import RemembrService, UnavailableRemembrService
 from go2_slam_web.map_registration import AutoMapRegistration
 from go2_slam_web.navigation import CameraBridge, NavigationState, OperationManager
 
 PORT = 8890
 MAPS_DIR = '/home/unitree/go2_slam_ws/maps'
 INDEX_PATH = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
+MAPPING_RESET_SCRIPT = '/home/unitree/go2_slam_ws/reset_mapping.sh'
 
 MAX_LIDAR_PTS = 1400          # 每帧推送给浏览器的雷达点数上限
 BROADCAST_HZ = 5.0            # WS 推送频率（足以匹配 LIO 位姿输出）
 MAP_PUSH_HZ = 1.0             # 地图 PNG/3D 推送频率
 MAX_3D_PTS = 40000            # 3D 视图每帧点数上限（均匀抽稀）
 MAX_MAP_PTS = 300000          # 保存/渲染接收的全局地图点上限
-Z3D_MAP = (-0.8, 3.5)         # 3D 建图层 z 带（墙到天花板）
+MAX_NAV_RAW_OBSTACLE_PTS = 4000       # Web 原始实时占据层抽样上限
+MAX_NAV_INFLATED_OBSTACLE_PTS = 8000  # Web 碰撞膨胀层抽样上限
+NAV_OBSTACLE_CAPTURE_HZ = 2.0         # 与 SCAN 的低频可视化层匹配，不影响内部规划
+MAX_BUILDING_Z = 50.0          # 楼梯/多楼层建图的合理绝对高度保护
+MAX_BUILDING_TILT = 1.1        # 允许陡楼梯，仍拒绝接近翻转的异常姿态
+Z3D_MAP = (-MAX_BUILDING_Z, MAX_BUILDING_Z)  # 3D/保存保留完整楼层高度
 
 # ---- 2D 栅格化参数 ----
 RES = 0.05                    # 栅格分辨率 (m/px)
@@ -549,14 +556,28 @@ class WebNode(Node):
         self.create_subscription(
             Path, '/scan_planner/local_path', self.navigation.update_local_path, 10)
         self.create_subscription(
+            Path, '/scan_planner/planning/local_horizon',
+            self.navigation.update_local_horizon, qos_profile_sensor_data)
+        self._nav_obstacle_last = {'raw': 0.0, 'inflated': 0.0}
+        self.create_subscription(
+            PointCloud2, '/scan_planner/grid_map/occupancy',
+            self.on_navigation_obstacles, qos_profile_sensor_data)
+        self.create_subscription(
+            PointCloud2, '/scan_planner/grid_map/occupancy_inflate',
+            self.on_navigation_obstacles_inflated, qos_profile_sensor_data)
+        self.create_subscription(
             Bool, '/scan_planner/planning/local_waiting',
             self.navigation.update_local_waiting, 10)
         self.create_subscription(
             String, '/scan_planner/recovery_status',
             self.navigation.update_recovery_status, 10)
         # 机身自带 IMU/电池状态；不使用摄像头附带的 /utlidar/imu。
+        # Web UI does not need the 200 Hz control-bus stream.  The robot also
+        # exposes the same LowState payload on /lf/lowstate at about 20 Hz;
+        # using it avoids a full CPU core of Python DDS deserialization while
+        # keeping battery and attitude display responsive.
         self.create_subscription(
-            LowState, '/lowstate', self.navigation.update_lowstate,
+            LowState, '/lf/lowstate', self.navigation.update_lowstate,
             qos_profile_sensor_data)
         self.global_path_pub = self.create_publisher(
             Path, '/scan_planner/global_path', 1)
@@ -574,21 +595,50 @@ class WebNode(Node):
             String, '/scan_planner/posture_command', 10)
         self.alignment_valid_pub = self.create_publisher(
             Bool, '/scan_planner/alignment_valid', 10)
+        self.nav2_goal_pub = self.create_publisher(
+            PoseStamped, '/go2/nav2/goal', 10)
+        self.nav2_cancel_pub = self.create_publisher(
+            Bool, '/go2/nav2/cancel', 10)
+        self.nav2_map_odom_pub = self.create_publisher(
+            TransformStamped, '/go2/nav2/map_to_odom', 10)
+        self.navigation_backend_pub = self.create_publisher(
+            String, '/go2/navigation/backend', 10)
         self.navigation.chassis_enable_callback = self.publish_chassis_enable
         self.chassis_status = {
             'connected': False, 'enabled': False, 'ready': False,
             'teleop_enabled': False, 'control_mode': 'navigation',
+            'navigation_backend': 'scan',
             'reason': '等待底盘安全门',
         }
+        self.chassis_status_t = 0.0
         self.create_subscription(
             String, '/scan_planner/chassis_status', self.on_chassis_status, 10)
         self.create_subscription(
             Bool, '/scan_planner/navigation_completed',
-            self.on_navigation_completed, 10)
-        self.planner_command_t = 0.0
-        self.planner_command = (0.0, 0.0, 0.0)
+            self.on_scan_navigation_completed, 10)
         self.create_subscription(
-            Twist, '/scan_planner/cmd_vel_test', self.on_planner_command, 10)
+            Bool, '/go2/nav2/navigation_completed',
+            self.on_nav2_navigation_completed, 10)
+        self.nav2_status = {
+            'state': 'offline', 'message': 'Nav2 影子服务未连接'}
+        self.nav2_status_t = 0.0
+        self.nav2_shadow_metrics = {}
+        self.create_subscription(
+            String, '/go2/nav2/status', self.on_nav2_status, 10)
+        self.create_subscription(
+            String, '/go2/nav2/shadow_metrics',
+            self.on_nav2_shadow_metrics, 10)
+        self.planner_commands = {
+            'scan': (0.0, 0.0, 0.0),
+            'nav2': (0.0, 0.0, 0.0),
+        }
+        self.planner_command_times = {'scan': 0.0, 'nav2': 0.0}
+        self.create_subscription(
+            Twist, '/scan_planner/cmd_vel_test',
+            lambda msg: self.on_planner_command('scan', msg), 10)
+        self.create_subscription(
+            Twist, '/go2/nav2/cmd_vel_safe',
+            lambda msg: self.on_planner_command('nav2', msg), 10)
 
         self.create_timer(1.0, self.update_lidar_rate)
         # Safety heartbeat must not share the single-threaded ROS callback
@@ -628,7 +678,8 @@ class WebNode(Node):
         # map_global 的 XY 已是从建图原点累积的全局坐标，不能
         # 复用局部雷达的 30 m 异常距离保护，否则大地图会被裁成圆。
         all_pts = pointcloud2_to_xyz(
-            msg, -20.0, 20.0, MAX_MAP_PTS, max_xy_range=None)
+            msg, -MAX_BUILDING_Z, MAX_BUILDING_Z,
+            MAX_MAP_PTS, max_xy_range=None)
         if all_pts is None or len(all_pts) == 0:
             return
         all_pts = np.asarray(all_pts, dtype=np.float32)
@@ -647,10 +698,11 @@ class WebNode(Node):
             png, meta = rendered
             png_url = 'data:image/png;base64,' + base64.b64encode(png).decode()
             stats = {
-                'pts': len(pts),
-                'range': 'x[%.1f,%.1f] y[%.1f,%.1f]' % (
-                    pts[:, 0].min(), pts[:, 0].max(),
-                    pts[:, 1].min(), pts[:, 1].max()),
+                'pts': len(all_pts),
+                'range': 'x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]' % (
+                    all_pts[:, 0].min(), all_pts[:, 0].max(),
+                    all_pts[:, 1].min(), all_pts[:, 1].max(),
+                    all_pts[:, 2].min(), all_pts[:, 2].max()),
             }
             # 栅格化和 PNG 压缩可能较慢，全部在锁外完成；锁内只替换快照。
             with self.lock:
@@ -674,7 +726,9 @@ class WebNode(Node):
         values = (p.position.x, p.position.y, p.position.z, roll, pitch, yaw)
         valid = all(math.isfinite(v) for v in values)
         reason = ''
-        if valid and (abs(p.position.z) > 1.0 or abs(roll) > 0.8 or abs(pitch) > 0.8):
+        if valid and (abs(p.position.z) > MAX_BUILDING_Z or
+                      abs(roll) > MAX_BUILDING_TILT or
+                      abs(pitch) > MAX_BUILDING_TILT):
             valid = False
             reason = 'LIO 姿态/高度越界'
         raw = (p.position.x, p.position.y, p.position.z, now)
@@ -720,6 +774,45 @@ class WebNode(Node):
     def on_navigation_pose(self, msg):
         q = msg.pose.pose.orientation
         self.navigation.update_pose(msg, euler_rpy(q.x, q.y, q.z, q.w))
+
+    def _capture_navigation_obstacles(self, msg, inflated):
+        layer = 'inflated' if inflated else 'raw'
+        now = time.monotonic()
+        if now - self._nav_obstacle_last[layer] < 1.0 / NAV_OBSTACLE_CAPTURE_HZ:
+            return
+        self._nav_obstacle_last[layer] = now
+        source_count = int(msg.width * msg.height)
+        if source_count == 0:
+            points = np.empty((0, 3), np.float32)
+            planning_points = points if inflated else None
+        elif inflated:
+            # Temporary-start selection is safety-relevant, so retain every
+            # live inflated voxel for that one-shot query. Continue sending a
+            # bounded uniform sample to the browser to preserve bandwidth.
+            planning_points = pointcloud2_to_xyz(
+                msg, -5.0, 5.0, source_count, max_xy_range=None)
+            if planning_points is None:
+                return
+            stride = max(
+                1, int(math.ceil(
+                    len(planning_points) / MAX_NAV_INFLATED_OBSTACLE_PTS)))
+            points = planning_points[::stride][:MAX_NAV_INFLATED_OBSTACLE_PTS]
+        else:
+            points = pointcloud2_to_xyz(
+                msg, -5.0, 5.0,
+                MAX_NAV_RAW_OBSTACLE_PTS,
+                max_xy_range=None)
+            if points is None:
+                return
+            planning_points = None
+        self.navigation.update_obstacle_cloud(
+            points, inflated, source_count, planning_points)
+
+    def on_navigation_obstacles(self, msg):
+        self._capture_navigation_obstacles(msg, False)
+
+    def on_navigation_obstacles_inflated(self, msg):
+        self._capture_navigation_obstacles(msg, True)
 
     def on_registration_cloud(self, msg):
         with self._registration_lock:
@@ -786,11 +879,34 @@ class WebNode(Node):
         message = Bool()
         message.data = bool(cancelled)
         self.navigation_cancel_pub.publish(message)
+        self.nav2_cancel_pub.publish(message)
+
+    def publish_nav2_goal(self, x, y):
+        values = (float(x), float(y))
+        if not all(math.isfinite(value) for value in values):
+            return False
+        message = PoseStamped()
+        message.header.frame_id = 'nav_map'
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.pose.position.x = values[0]
+        message.pose.position.y = values[1]
+        message.pose.orientation.w = 1.0
+        self.nav2_goal_pub.publish(message)
+        return True
 
     def publish_chassis_enable(self, enabled):
         message = Bool()
         message.data = bool(enabled)
         self.chassis_enable_pub.publish(message)
+
+    def publish_navigation_backend(self, backend):
+        backend = str(backend).strip().lower()
+        if backend not in ('scan', 'nav2'):
+            return False
+        message = String()
+        message.data = backend
+        self.navigation_backend_pub.publish(message)
+        return True
 
     def publish_teleop_enable(self, enabled):
         message = Bool()
@@ -828,6 +944,18 @@ class WebNode(Node):
         alignment = Bool()
         alignment.data = self.navigation.is_alignment_valid()
         self.alignment_valid_pub.publish(alignment)
+        transform = self.navigation.nav2_map_to_odom_tf()
+        if transform is not None:
+            message = TransformStamped()
+            message.header.frame_id = 'nav_map'
+            message.child_frame_id = 'odom'
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.transform.translation.x = transform['x']
+            message.transform.translation.y = transform['y']
+            message.transform.translation.z = transform['z']
+            message.transform.rotation.z = math.sin(0.5 * transform['yaw'])
+            message.transform.rotation.w = math.cos(0.5 * transform['yaw'])
+            self.nav2_map_odom_pub.publish(message)
 
     def _heartbeat_loop(self):
         period = 0.20
@@ -860,6 +988,7 @@ class WebNode(Node):
             if isinstance(status, dict):
                 was_enabled = bool(self.chassis_status.get('enabled'))
                 self.chassis_status = status
+                self.chassis_status_t = time.monotonic()
                 if (was_enabled and not status.get('enabled') and
                         self.navigation.has_active_goal()):
                     reason = str(status.get('reason') or '底盘安全门已锁定')
@@ -873,23 +1002,54 @@ class WebNode(Node):
         except (TypeError, ValueError):
             pass
 
-    def on_navigation_completed(self, msg):
-        if not msg.data:
+    def complete_navigation(self, source):
+        selected = self.chassis_status.get('navigation_backend', 'scan')
+        if selected != source:
+            self.get_logger().info(
+                'Ignored %s shadow completion; selected backend is %s' %
+                (source.upper(), selected.upper()))
             return
-        # SCAN is the source of truth for trajectory completion. Clear both
-        # the browser-side route and every downstream command, then disarm the
-        # chassis so an expired trajectory can never keep control ownership.
+        # The selected controller is the source of truth for completion. Clear
+        # all parallel planners and lock the chassis before accepting a new goal.
         self.navigation.clear_navigation('已到达目标点')
         self.publish_global_path([])
         self.publish_navigation_cancel(True)
         self.publish_chassis_enable(False)
         self.get_logger().info(
-            'Navigation completed; route cleared and chassis locked')
+            '%s navigation completed; route cleared and chassis locked' %
+            source.upper())
 
-    def on_planner_command(self, msg):
-        self.planner_command = (
+    def on_scan_navigation_completed(self, msg):
+        if not msg.data:
+            return
+        self.complete_navigation('scan')
+
+    def on_nav2_navigation_completed(self, msg):
+        if not msg.data:
+            return
+        self.complete_navigation('nav2')
+
+    def on_nav2_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+            if isinstance(status, dict):
+                self.nav2_status = status
+                self.nav2_status_t = time.monotonic()
+        except (TypeError, ValueError):
+            pass
+
+    def on_nav2_shadow_metrics(self, msg):
+        try:
+            status = json.loads(msg.data)
+            if isinstance(status, dict):
+                self.nav2_shadow_metrics = status
+        except (TypeError, ValueError):
+            pass
+
+    def on_planner_command(self, backend, msg):
+        self.planner_commands[backend] = (
             float(msg.linear.x), float(msg.linear.y), float(msg.angular.z))
-        self.planner_command_t = time.time()
+        self.planner_command_times[backend] = time.time()
 
     def update_lidar_rate(self):
         with self.lock:
@@ -898,6 +1058,36 @@ class WebNode(Node):
             self.lidar_rate = self.lidar_n / dt if dt > 0 else 0.0
             self.lidar_n = 0
             self.lidar_t0 = now
+
+    def reset_mapping(self):
+        """Replace the in-memory LIO instance, then clear every Web map cache."""
+        try:
+            result = subprocess.run(
+                ['/bin/bash', MAPPING_RESET_SCRIPT],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=40.0)
+        except subprocess.TimeoutExpired:
+            return False, 'LIO-SAM 重启超时；当前建图未确认清除'
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            return False, output or 'LIO-SAM 重启失败，当前建图未确认清除'
+
+        with self.lock:
+            self.map_png = None
+            self.map_meta = None
+            self.map_t = 0.0
+            self.map_pts_all = None
+            self.map_full_pts = None
+            self.ground_pts_all = None
+            self.map3d_pts = None
+            self.ground3d_pts = None
+            self.map_stats = {'pts': 0, 'range': '--'}
+            self.pose = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 't': 0.0}
+            self.pose_t = 0.0
+            self.pose_valid = False
+            self.pose_error = '等待 LIO 重新初始化'
+            self._last_raw_pose = None
+        return True, output or '当前建图已清除，LIO-SAM 正在重新初始化'
 
     # ---- 保存地图 ----
 
@@ -1038,6 +1228,7 @@ class ApiStatusHandler(tornado.web.RequestHandler):
             'map_stats': snap['map_stats'],
             'health': snap['health'],
             'chassis': dict(self.application.web_node.chassis_status),
+            'nav2': dict(self.application.web_node.nav2_status),
             'maps_dir': MAPS_DIR,
             'mode': self.application.operations.mode,
         }))
@@ -1062,6 +1253,9 @@ class ApiModeHandler(tornado.web.RequestHandler):
             self.write(json.dumps({'success': False, 'message': 'JSON 格式错误'}))
             return
         chassis = self.application.web_node.chassis_status
+        if target != 'navigation':
+            await tornado.ioloop.IOLoop.current().run_in_executor(
+                None, self.application.remembr.set_enabled, False)
         preserve_teleop = bool(
             self.application.teleop_owner and chassis.get('teleop_enabled') and
             chassis.get('enabled'))
@@ -1090,6 +1284,9 @@ class ApiMappingHandler(tornado.web.RequestHandler):
         elif action == 'stop':
             callback = self.application.operations.stop_mapping
             args = (None, False)
+        elif action == 'clear':
+            callback = self.application.operations.clear_mapping
+            args = ()
         else:
             self.set_status(400)
             self.write(json.dumps({'success': False, 'message': '未知建图操作'}))
@@ -1171,15 +1368,23 @@ class ApiNavigationGoalHandler(tornado.web.RequestHandler):
             issued_at = time.time()
             self.application.web_node.publish_navigation_cancel(False)
             self.application.web_node.publish_global_path(points)
+            adjusted_goal = self.application.navigation.goal
+            if adjusted_goal is not None:
+                self.application.web_node.publish_nav2_goal(
+                    adjusted_goal['x'], adjusted_goal['y'])
             # A blocked live lidar grid is a persistent wait state, not a
             # terminal navigation failure.  Keep the global target and chassis
             # ownership; SCAN publishes a zero-speed hold and retries locally
             # until the obstacle clears or the operator explicitly cancels.
             command_ready = False
+            backend = str(chassis.get('navigation_backend', 'scan'))
             deadline = time.time() + 3.0
             while time.time() < deadline:
-                command = self.application.web_node.planner_command
-                if (self.application.web_node.planner_command_t > issued_at and
+                command = self.application.web_node.planner_commands.get(
+                    backend, (0.0, 0.0, 0.0))
+                command_t = self.application.web_node.planner_command_times.get(
+                    backend, 0.0)
+                if (command_t > issued_at and
                         max(abs(value) for value in command) > 0.01):
                     command_ready = True
                     break
@@ -1244,6 +1449,90 @@ class ApiNavigationCancelHandler(tornado.web.RequestHandler):
         self.write(json.dumps({
             'success': True,
             'message': '导航已取消，目标和规划路径已清除',
+        }))
+
+
+class ApiNavigationBackendHandler(tornado.web.RequestHandler):
+    """Select one actuator command owner while the physical gate is locked."""
+
+    def get(self):
+        chassis = self.application.web_node.chassis_status
+        self.write(json.dumps({
+            'backend': chassis.get('navigation_backend', 'scan'),
+            'chassis_enabled': bool(chassis.get('enabled')),
+            'nav2_online': (
+                time.monotonic() - self.application.web_node.nav2_status_t < 1.5),
+            'nav2': dict(self.application.web_node.nav2_status),
+        }))
+
+    async def post(self):
+        if self.application.operations.mode != 'navigation':
+            self.set_status(409)
+            self.write(json.dumps({
+                'success': False, 'message': '请先进入导航页面'}))
+            return
+        try:
+            body = json.loads(self.request.body.decode('utf-8') or '{}')
+            backend = str(body['backend']).strip().lower()
+            if backend not in ('scan', 'nav2'):
+                raise ValueError()
+        except Exception:
+            self.set_status(400)
+            self.write(json.dumps({
+                'success': False, 'message': '后端只能是 scan 或 nav2'}))
+            return
+
+        status = self.application.web_node.chassis_status
+        if status.get('enabled'):
+            self.set_status(409)
+            self.write(json.dumps({
+                'success': False,
+                'message': '底盘启用期间不能切换导航后端；请先取消并锁定底盘',
+            }))
+            return
+        if backend == 'nav2':
+            nav2_age = time.monotonic() - self.application.web_node.nav2_status_t
+            nav2_state = self.application.web_node.nav2_status.get('state')
+            if nav2_age >= 1.5 or nav2_state in ('offline', 'error'):
+                self.set_status(409)
+                self.write(json.dumps({
+                    'success': False,
+                    'message': 'Nav2 服务未就绪，不能选为真实控制后端',
+                    'nav2': self.application.web_node.nav2_status,
+                }))
+                return
+
+        # Invalidate every old trajectory before handing command ownership to
+        # another producer. The gate itself independently refuses armed switch.
+        self.application.navigation.clear_navigation(
+            '正在切换导航后端，旧目标已清除')
+        self.application.teleop_owner = None
+        self.application.web_node.publish_teleop_stop()
+        self.application.web_node.publish_teleop_enable(False)
+        self.application.web_node.publish_navigation_cancel(True)
+        self.application.web_node.publish_global_path([])
+        self.application.web_node.publish_chassis_enable(False)
+        await tornado.gen.sleep(0.10)
+        self.application.web_node.publish_navigation_backend(backend)
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            await tornado.gen.sleep(0.05)
+            status = self.application.web_node.chassis_status
+            if (not status.get('enabled') and
+                    status.get('navigation_backend') == backend):
+                self.write(json.dumps({
+                    'success': True,
+                    'message': '已选择%s；底盘保持锁定，请重新启用后发送新目标' %
+                               backend.upper(),
+                    'backend': backend,
+                }))
+                return
+        self.set_status(503)
+        self.write(json.dumps({
+            'success': False,
+            'message': '安全门未确认后端切换，底盘保持锁定',
+            'status': status,
         }))
 
 
@@ -1423,6 +1712,32 @@ class ApiNavigationAlignmentHandler(tornado.web.RequestHandler):
         }))
 
 
+def chassis_cancel_is_safe(status):
+    """Return true only for an explicitly cancelled, disarmed, zero output."""
+    if not isinstance(status, dict):
+        return False
+    if not status.get('cancelled') or status.get('enabled'):
+        return False
+    output = status.get('output')
+    if not isinstance(output, (list, tuple)) or len(output) < 3:
+        return False
+    try:
+        return max(abs(float(value)) for value in output[:3]) <= 1e-3
+    except (TypeError, ValueError):
+        return False
+
+
+def chassis_cancel_acknowledged(status, status_age, previous_cancel_seq):
+    """Require a fresh acknowledgement for the cancellation just published."""
+    try:
+        return (
+            float(status_age) <= 1.0 and
+            int(status.get('cancel_seq', 0) or 0) > int(previous_cancel_seq) and
+            chassis_cancel_is_safe(status))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 class ApiNavigationChassisHandler(tornado.web.RequestHandler):
     """Explicitly arm or lock the physical chassis safety gate."""
 
@@ -1488,15 +1803,23 @@ class ApiNavigationChassisHandler(tornado.web.RequestHandler):
             self.application.navigation.clear_navigation(
                 '底盘已启用，请检查环境后发送新的目标点')
             previous_cancel_seq = int(status.get('cancel_seq', 0) or 0)
+            # Publish exactly one reliable cancellation, then wait for the
+            # gate to acknowledge that specific message. Accepting an older
+            # safe state while still publishing a new cancel creates a
+            # cross-topic race: the late cancel can otherwise arrive just
+            # after the enable request and immediately lock the chassis again.
+            cancel_confirmed = False
             self.application.web_node.publish_navigation_cancel(True)
             self.application.web_node.publish_global_path([])
-            cancel_deadline = time.time() + 1.0
-            while time.time() < cancel_deadline:
-                status = self.application.web_node.chassis_status
-                if int(status.get('cancel_seq', 0) or 0) > previous_cancel_seq:
-                    break
+            cancel_deadline = time.monotonic() + 3.0
+            while not cancel_confirmed and time.monotonic() < cancel_deadline:
                 await tornado.gen.sleep(0.05)
-            else:
+                status = self.application.web_node.chassis_status
+                status_age = time.monotonic() - getattr(
+                    self.application.web_node, 'chassis_status_t', 0.0)
+                cancel_confirmed = chassis_cancel_acknowledged(
+                    status, status_age, previous_cancel_seq)
+            if not cancel_confirmed:
                 self.set_status(503)
                 self.write(json.dumps({
                     'success': False,
@@ -1512,8 +1835,8 @@ class ApiNavigationChassisHandler(tornado.web.RequestHandler):
             self.application.web_node.publish_navigation_cancel(True)
             self.application.web_node.publish_global_path([])
         if enabled and ok:
-            arm_deadline = time.time() + 1.0
-            while time.time() < arm_deadline:
+            arm_deadline = time.monotonic() + 3.0
+            while time.monotonic() < arm_deadline:
                 status = self.application.web_node.chassis_status
                 if status.get('enabled'):
                     break
@@ -1581,15 +1904,18 @@ class ApiNavigationTeleopHandler(tornado.web.RequestHandler):
         # selecting the new command source.
         self.application.navigation.clear_navigation('正在切换到键盘控制')
         previous_cancel_seq = int(status.get('cancel_seq', 0) or 0)
+        cancel_confirmed = False
         self.application.web_node.publish_navigation_cancel(True)
         self.application.web_node.publish_global_path([])
-        cancel_deadline = time.time() + 1.0
-        while time.time() < cancel_deadline:
-            status = self.application.web_node.chassis_status
-            if int(status.get('cancel_seq', 0) or 0) > previous_cancel_seq:
-                break
+        cancel_deadline = time.monotonic() + 3.0
+        while not cancel_confirmed and time.monotonic() < cancel_deadline:
             await tornado.gen.sleep(0.05)
-        else:
+            status = self.application.web_node.chassis_status
+            status_age = time.monotonic() - getattr(
+                self.application.web_node, 'chassis_status_t', 0.0)
+            cancel_confirmed = chassis_cancel_acknowledged(
+                status, status_age, previous_cancel_seq)
+        if not cancel_confirmed:
             self._disable('键盘控制切换失败，底盘保持锁定')
             self.set_status(503)
             self.write(json.dumps({
@@ -1599,10 +1925,13 @@ class ApiNavigationTeleopHandler(tornado.web.RequestHandler):
 
         self.application.teleop_owner = client_id
         self.application.web_node.publish_teleop_enable(True)
-        select_deadline = time.time() + 1.0
-        while time.time() < select_deadline:
+        select_deadline = time.monotonic() + 3.0
+        while time.monotonic() < select_deadline:
             status = self.application.web_node.chassis_status
-            if status.get('teleop_enabled') and status.get('ready'):
+            status_age = time.monotonic() - getattr(
+                self.application.web_node, 'chassis_status_t', 0.0)
+            if (status_age <= 1.0 and status.get('teleop_enabled') and
+                    status.get('ready')):
                 break
             await tornado.gen.sleep(0.05)
         else:
@@ -1624,11 +1953,14 @@ class ApiNavigationTeleopHandler(tornado.web.RequestHandler):
             self.set_status(409)
             self.write(json.dumps({'success': False, 'message': message}))
             return
-        arm_deadline = time.time() + 1.0
-        while time.time() < arm_deadline:
+        arm_deadline = time.monotonic() + 3.0
+        while time.monotonic() < arm_deadline:
             self.application.web_node.publish_teleop_stop()
             status = self.application.web_node.chassis_status
-            if status.get('enabled') and status.get('teleop_enabled'):
+            status_age = time.monotonic() - getattr(
+                self.application.web_node, 'chassis_status_t', 0.0)
+            if (status_age <= 1.0 and status.get('enabled') and
+                    status.get('teleop_enabled')):
                 break
             await tornado.gen.sleep(0.05)
         else:
@@ -1747,6 +2079,94 @@ class ApiNavigationCameraHandler(tornado.web.RequestHandler):
         self.set_header('Content-Type', 'image/jpeg')
         self.set_header('Cache-Control', 'no-store, no-cache, must-revalidate')
         self.write(image)
+
+
+class ApiRemembrStatusHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_header('Content-Type', 'application/json; charset=utf-8')
+        self.set_header('Cache-Control', 'no-store')
+        self.write(json.dumps(self.application.remembr.status()))
+
+
+class ApiRemembrControlHandler(tornado.web.RequestHandler):
+    async def post(self):
+        try:
+            body = json.loads(self.request.body.decode('utf-8') or '{}')
+            enabled = body['enabled']
+            if not isinstance(enabled, bool):
+                raise ValueError()
+        except Exception:
+            self.set_status(400)
+            self.write(json.dumps({
+                'success': False, 'message': 'enabled 必须是布尔值',
+            }))
+            return
+        if enabled and self.application.operations.mode != 'navigation':
+            self.set_status(409)
+            self.write(json.dumps({
+                'success': False, 'message': '请先进入导航模式',
+            }))
+            return
+        ok, message = await tornado.ioloop.IOLoop.current().run_in_executor(
+            None, self.application.remembr.set_enabled, enabled)
+        if not ok:
+            self.set_status(409)
+        self.write(json.dumps({
+            'success': ok, 'message': message,
+            'status': self.application.remembr.status(),
+        }))
+
+
+class ApiRemembrMemoryHandler(tornado.web.RequestHandler):
+    async def post(self):
+        try:
+            body = json.loads(self.request.body.decode('utf-8') or '{}')
+            caption = str(body.get('caption', '')).strip()
+            if not caption or len(caption) > 3000:
+                raise ValueError()
+        except Exception:
+            self.set_status(400)
+            self.write(json.dumps({
+                'success': False, 'message': '记忆描述不能为空且不能超过 3000 字符',
+            }))
+            return
+        ok, message, memory_id = await tornado.ioloop.IOLoop.current().run_in_executor(
+            None, self.application.remembr.add_manual, caption)
+        if not ok:
+            self.set_status(409)
+        self.write(json.dumps({
+            'success': ok, 'message': message, 'memory_id': memory_id,
+        }))
+
+
+class ApiRemembrQueryHandler(tornado.web.RequestHandler):
+    """Retrieve and preview one candidate; this endpoint never commands motion."""
+
+    async def post(self):
+        try:
+            body = json.loads(self.request.body.decode('utf-8') or '{}')
+            if not isinstance(body, dict):
+                raise ValueError()
+        except Exception:
+            self.set_status(400)
+            self.write(json.dumps({'success': False, 'message': 'JSON 格式错误'}))
+            return
+        if not self.application.planning_lock.acquire(blocking=False):
+            self.set_status(409)
+            self.write(json.dumps({
+                'success': False,
+                'message': '已有一个全局路径请求正在计算，请等待其结束',
+                'memories': [], 'candidate': None,
+            }))
+            return
+        try:
+            result = await tornado.ioloop.IOLoop.current().run_in_executor(
+                None, self.application.remembr.query, body)
+        finally:
+            self.application.planning_lock.release()
+        if not result.get('success'):
+            self.set_status(400)
+        self.write(json.dumps(result))
 
 
 class ApiSaveHandler(tornado.web.RequestHandler):
@@ -2081,11 +2501,12 @@ class WsHandler(tornado.websocket.WebSocketHandler):
 
 class Application(tornado.web.Application):
 
-    def __init__(self, web_node, navigation, camera, operations):
+    def __init__(self, web_node, navigation, camera, operations, remembr):
         self.web_node = web_node
         self.navigation = navigation
         self.camera = camera
         self.operations = operations
+        self.remembr = remembr
         self.teleop_owner = None
         # Global footprint A* is CPU-heavy and cannot be safely duplicated by
         # refreshing the page or opening a second browser tab.
@@ -2111,11 +2532,16 @@ class Application(tornado.web.Application):
             (r'/api/navigation/goal', ApiNavigationGoalHandler),
             (r'/api/navigation/preview', ApiNavigationPreviewHandler),
             (r'/api/navigation/cancel', ApiNavigationCancelHandler),
+            (r'/api/navigation/backend', ApiNavigationBackendHandler),
             (r'/api/navigation/alignment', ApiNavigationAlignmentHandler),
             (r'/api/navigation/chassis', ApiNavigationChassisHandler),
             (r'/api/navigation/teleop', ApiNavigationTeleopHandler),
             (r'/api/navigation/posture', ApiNavigationPostureHandler),
             (r'/api/navigation/camera.jpg', ApiNavigationCameraHandler),
+            (r'/api/remembr/status', ApiRemembrStatusHandler),
+            (r'/api/remembr/control', ApiRemembrControlHandler),
+            (r'/api/remembr/memory', ApiRemembrMemoryHandler),
+            (r'/api/remembr/query', ApiRemembrQueryHandler),
             (r'/ws', WsHandler),
         ]
         super().__init__(handlers)
@@ -2153,13 +2579,18 @@ def broadcast_loop(app, ioloop):
                 frame = app.navigation.snapshot(
                     app.camera.status(), app.operations.planner_active(),
                     chassis_status=app.web_node.chassis_status,
-                    with_paths=(n % 2 == 0))
+                    with_paths=(n % 2 == 0),
+                    with_obstacles=(n % 2 == 0))
                 frame['t'] = time.time()
             else:
                 frame = {'mode': 'maps', 't': time.time()}
             # The top navigation controls are global.  Keep their safety state
             # live without enabling any heavy map, camera or SCAN stream.
             frame['chassis'] = dict(app.web_node.chassis_status)
+            frame['nav2'] = dict(app.web_node.nav2_status)
+            frame['nav2']['online'] = (
+                time.monotonic() - app.web_node.nav2_status_t < 1.5)
+            frame['nav2_shadow'] = dict(app.web_node.nav2_shadow_metrics)
             payload = json.dumps(frame)
             ioloop.add_callback(push_frame, app, payload)
         except Exception:
@@ -2176,7 +2607,15 @@ def main(args=None):
     # 在 ROS executor 开始前就根据持久运行的 SCAN 服务确定首屏模式，
     # 避免导航首屏短暂订阅建图大点云。
     operations = OperationManager(
-        navigation, camera, node.do_save, node.set_mapping_streams)
+        navigation, camera, node.do_save, node.set_mapping_streams,
+        node.reset_mapping)
+    try:
+        remembr = RemembrService(camera, navigation)
+    except Exception as exc:
+        # Semantic memory is optional. A malformed model config or damaged DB
+        # must not prevent the established SLAM/navigation console from booting.
+        remembr = UnavailableRemembrService(exc)
+        print('端侧语义记忆已安全降级: %s' % exc, flush=True)
 
     # ROS 回调已在独立线程，且预览点云已由 C++ 抽稀；单线程执行器避免默认
     # MultiThreadedExecutor 在本机 CycloneDDS 下空转占用多个 CPU 核。
@@ -2186,7 +2625,7 @@ def main(args=None):
     ros_thread = threading.Thread(target=ex.spin, daemon=True)
     ros_thread.start()
 
-    app = Application(node, navigation, camera, operations)
+    app = Application(node, navigation, camera, operations, remembr)
     app.listen(PORT, address='0.0.0.0')
     print('GO2-W 建图/导航控制台: http://<机器人IP>:%d' % PORT, flush=True)
 
@@ -2197,6 +2636,7 @@ def main(args=None):
         ioloop.start()
     except KeyboardInterrupt:
         pass
+    remembr.shutdown()
     operations.shutdown()
     node.destroy_node()
     rclpy.shutdown()

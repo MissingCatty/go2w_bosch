@@ -36,6 +36,52 @@ void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
     grid_map_ = occ_map;
 }
 
+void AStar::setClearanceCost(const double distance, const double weight)
+{
+    clearance_distance_ = std::max(0.0, distance);
+    clearance_weight_ = std::max(0.0, weight);
+}
+
+double AStar::clearancePenalty(const Eigen::Vector3d &pos, const double yaw) const
+{
+    if (!grid_map_ || clearance_distance_ <= 1e-6 ||
+        clearance_weight_ <= 1e-6 || step_size_ <= 1e-6)
+        return 0.0;
+
+    // Probe the configuration-space obstacle layer around the complete robot
+    // capsule. The red inflated layer remains the hard collision boundary;
+    // this outer band is only a soft preference, so a narrow but valid passage
+    // is still searchable when no roomier alternative exists.
+    static constexpr double directions[16][2] = {
+        {1.0, 0.0}, {0.9238795, 0.3826834}, {0.7071068, 0.7071068},
+        {0.3826834, 0.9238795}, {0.0, 1.0}, {-0.3826834, 0.9238795},
+        {-0.7071068, 0.7071068}, {-0.9238795, 0.3826834}, {-1.0, 0.0},
+        {-0.9238795, -0.3826834}, {-0.7071068, -0.7071068},
+        {-0.3826834, -0.9238795}, {0.0, -1.0}, {0.3826834, -0.9238795},
+        {0.7071068, -0.7071068}, {0.9238795, -0.3826834}};
+
+    const int rings = std::max(
+        1, static_cast<int>(std::ceil(clearance_distance_ / step_size_)));
+    for (int ring = 1; ring <= rings; ++ring)
+    {
+        const double radius = std::min(clearance_distance_, ring * step_size_);
+        for (const auto &direction : directions)
+        {
+            Eigen::Vector3d probe = pos;
+            probe.x() += radius * direction[0];
+            probe.y() += radius * direction[1];
+            if (grid_map_->getInflateOccupancy(probe, yaw) != 0)
+            {
+                const double normalized = std::clamp(
+                    (clearance_distance_ - radius) / clearance_distance_,
+                    0.0, 1.0);
+                return clearance_weight_ * normalized * normalized;
+            }
+        }
+    }
+    return 0.0;
+}
+
 double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
 {
     double dx = abs(node1->index(0) - node2->index(0));
@@ -227,6 +273,8 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
 
                 const int dz = neighborIdx(2) - current->index(2);
                 double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
+                static_cost *= 1.0 + clearancePenalty(
+                    Index2Coord(neighborPtr->index), neighbor_yaw);
                 tentative_gScore = current->gScore + static_cost;
 
                 if (!flag_explored)

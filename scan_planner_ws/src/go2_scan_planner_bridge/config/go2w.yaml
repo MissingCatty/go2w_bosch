@@ -3,27 +3,40 @@ scan_planner_node:
     use_sim_time: false
     # Web 界面发布经过静态栅格 A* 的 nav_msgs/Path，SCAN 负责局部重规划。
     fsm.navi_mode: 3
-    fsm.thresh_replan: 0.8
+    # Event-triggered policy: keep executing the accepted local B-spline while
+    # its next 0.5 m is clear. Periodic candidate generation is disabled;
+    # blocked-path, tracking-recovery, new-goal and path-end events still plan.
+    fsm.periodic_replan_enabled: false
+    fsm.periodic_replan_interval: 0.20
+    fsm.collision_replan_horizon: 0.50
+    # Carry the controller's executable velocity into each event-driven
+    # replacement spline so obstacle detours do not restart from zero speed.
+    fsm.controller_velocity_timeout: 0.35
     fsm.thresh_no_replan: 0.15
-    # The live voxel map is 10 m wide and centered on the robot.  A 5 m
-    # horizon put the target itself on its fail-closed boundary (before even
-    # accounting for the front/rear footprint centres).  Keep enough boundary
-    # and A-star-pool margin for a real lateral detour.
-    fsm.planning_horizon: 4.0
+    # Select the local planning target 3 m ahead along the remaining global
+    # route. The 10 m live voxel map still leaves room for lateral A* detours.
+    fsm.planning_horizon: 3.0
     fsm.emergency_time: 0.8
     fsm.fail_safe: true
     fsm.max_replan_fail_count: 10
     # A blocked local plan keeps the global target, holds zero velocity and
     # retries against the live lidar grid.  Manual cancel/completion still end it.
-    fsm.replan_retry_interval: 1.0
+    fsm.replan_retry_interval: 0.20
     # Cross-state arrival handling: the 15 cm value above still controls
     # trajectory replanning.  A stopped ground robot may report arrival within
-    # 30 cm so a dynamically infeasible final short spline cannot leave the UI
+    # 50 cm so a dynamically infeasible final short spline cannot leave the UI
     # stuck in navigation forever.
     fsm.goal_stop_speed: 0.08
-    fsm.goal_arrival_tolerance: 0.30
+    fsm.goal_arrival_tolerance: 0.50
     # Refuse all planning/output when the fused live lidar grid is stale.
-    fsm.live_cloud_timeout: 0.60
+    # LIO-SAM deskew occasionally has a measured processing gap up to 1.20 s
+    # even while the raw XT16 remains healthy at 10 Hz.  Keep this planner-side
+    # timeout above that jitter; the independent raw-scan controller watchdog
+    # below remains at 0.35 s and still stops immediately on a real lidar loss.
+    fsm.live_cloud_timeout: 1.30
+    # A Web route whose first point is farther than the normal 15 cm start
+    # snap is a temporary static-map entry. Keep targeting it until reached.
+    fsm.reference_entry_tolerance: 0.18
     # A route that was blocked may resume only after independent fresh fused
     # observations repeatedly agree that the local plan is executable.
     fsm.resume_clear_observations: 3
@@ -36,11 +49,10 @@ scan_planner_node:
     grid_map.local_update_range_z: 2.5
     grid_map.map_sliding_en: true
     grid_map.map_sliding_thresh: 0.2
-    # Go2-W standing footprint is about 0.70 m x 0.43 m.  Two circles with
-    # r=0.23 m and +/-0.12 m centres form a 0.70 m x 0.46 m capsule, retaining
-    # a small lateral safety margin without the former 0.96 m x 0.60 m body.
-    grid_map.double_cylinder_radius: 0.23
-    grid_map.double_cylinder_offset: 0.12
+    # Slightly enlarged local-planning footprint: two r=0.18 m circles at
+    # +/-0.13 m form an approximately 0.62 m x 0.36 m capsule.
+    grid_map.double_cylinder_radius: 0.18
+    grid_map.double_cylinder_offset: 0.13
     grid_map.body_height: 0.45
     grid_map.obstacles_inflation_z_up: 0.12
     grid_map.obstacles_inflation_z_down: 0.42
@@ -50,15 +62,15 @@ scan_planner_node:
     grid_map.sensor_type: lidar
     grid_map.cloud_is_world: false
     grid_map.need_extrinsic: false
-    # Static map ownership stops at the Web A* global planner.  Feeding the
-    # same saved cloud into SCAN's sliding grid made old people/map noise block
-    # an otherwise clear live start. Temporary obstacle avoidance still uses
-    # the current lidar cloud (while retaining the real two-cylinder body model).
+    # LIO pose arrives 0.1--0.4 s after its point cloud and only at about 4 Hz.
+    # Buffer clouds until bracketing poses exist, then interpolate at the exact
+    # cloud timestamp instead of projecting with an arbitrarily stale pose.
+    grid_map.lidar_pose_max_gap: 0.45
+    grid_map.lidar_cloud_max_wait: 0.65
+    # Static map ownership stops at the Web A* global planner. SCAN's local
+    # occupancy, collision checks and recovery use only the current lidar.
     grid_map.use_static_map: false
-    # The processed/inflated 2-D navigation grid is a separate immutable hard
-    # boundary. It prevents a live local detour from crossing a saved wall,
-    # without mixing stale 3-D map points into the live lidar occupancy layer.
-    grid_map.use_static_navigation_grid: true
+    grid_map.use_static_navigation_grid: false
     grid_map.p_hit: 0.85
     grid_map.p_miss: 0.30
     grid_map.p_min: 0.12
@@ -85,24 +97,35 @@ scan_planner_node:
     manager.max_jerk: 2.0
     manager.control_points_distance: 0.15
     manager.feasibility_tolerance: 0.35
-    manager.planning_horizon: 4.0
-    # Let the local planner move far enough off the centreline to pass a chair.
-    # The immutable inflated navigation grid above, rather than this soft
-    # corridor, is now the hard wall-crossing guard.
-    # A chair/person-sized live obstacle currently needs about 1.2 m of
-    # lateral deviation on the test route.  Static walls remain immutable hard
-    # constraints in GridMap, so this soft reference corridor can allow the
-    # local planner enough room to go around the obstacle without permitting
-    # wall crossing.
-    manager.reference_corridor_tolerance: 1.50
+    manager.planning_horizon: 3.5
+    # Independent wheel-friendly generator. Set this back to "legacy" to use
+    # the old generator; also disable controller curvature tracking below for
+    # a full old/new control A/B comparison. BsplineOptimizer remains unchanged.
+    manager.bspline_generator: curvature_constrained
+    curvature_bspline.min_turn_radius: 0.80
+    curvature_bspline.curvature_tolerance: 0.15
+    curvature_bspline.sample_dt: 0.05
+    curvature_bspline.min_sample_distance: 0.02
+    curvature_bspline.max_deviation: 0.35
+    curvature_bspline.lambda_curvature: 30.0
+    curvature_bspline.lambda_reference: 2.0
+    curvature_bspline.lambda_smoothness: 0.20
+    curvature_bspline.lambda_deviation_barrier: 80.0
+    curvature_bspline.numerical_gradient_step: 0.0001
+    curvature_bspline.max_iterations: 35
+    # Shortest-path baseline: do not add a soft penalty outside the red hard
+    # collision layer. Local A* therefore prefers the shorter collision-free
+    # route instead of deliberately keeping extra distance from obstacles.
+    astar.clearance_distance: 0.0
+    astar.clearance_weight: 0.0
+    # The global route is only a seed/direction reference. There is no hard
+    # geometric corridor around it; live lidar collision checks own validity.
     optimization.lambda_smooth: 1.0
     optimization.lambda_collision: 1.5
     optimization.lambda_feasibility: 0.2
-    # Keep a mild preference for the global centreline, but let the collision
-    # term (1.5, doubled on each failed rebound) move the spline around a live
-    # obstacle. The former value 50 overpowered every collision retry and
-    # pulled each candidate straight back into the chair.
-    optimization.lambda_fitness: 2.0
+    # Keep only a very weak shape preference for the global route. Collision
+    # avoidance is ten times stronger, so SCAN can take a wide live detour.
+    optimization.lambda_fitness: 0.15
     optimization.dist0: 0.30
     optimization.max_vel: 0.80
     optimization.max_acc: 0.60
@@ -123,33 +146,117 @@ closed_loop_controller:
     max_vx: 0.80
     max_vy: 0.15
     max_vyaw: 0.45
+    # Only enabled for the curvature-constrained A/B branch. It supplies the
+    # rolling v*kappa yaw rate and slows a bend when 0.45 rad/s is insufficient.
+    curvature_tracking_enabled: true
+    curvature_preview_time: 0.20
+    curvature_yaw_reserve: 0.08
+    curvature_feedforward_gain: 1.0
+    curvature_deadband: 0.05
     # Planner, controller and physical safety gate share the same 0.80 m/s
-    # forward ceiling. Pause reference time if real tracking still falls behind
-    # instead of expiring the local trajectory before the robot catches up.
-    max_tracking_error: 0.25
-    tracking_error_release: 0.12
-    tracking_stall_timeout: 2.5
+    # forward ceiling. Tracking deviation no longer discards an otherwise
+    # executable trajectory; live collision and stream checks remain active.
     finish_dist: 0.15
+    # Periodic candidates are disabled above, so every published candidate is
+    # now caused by an obstacle, recovery, new goal or path-end continuation.
+    # Accept those event-driven replacements immediately.
+    trajectory_switch_min_interval: 0.0
+    trajectory_switch_max_interval: 0.0
+    trajectory_switch_compare_distance: 0.50
+    trajectory_switch_max_deviation: 0.18
+    trajectory_switch_min_remaining: 0.60
+    trajectory_collision_lookahead: 0.50
+    # Preserve the 0.80 m/s cruise speed in open space, but derive a lower
+    # admissible speed from the remaining physical stopping distance.
+    goal_stop_distance: 0.15
+    goal_brake_decel: 0.45
+    goal_reaction_time: 0.15
+    obstacle_brake_decel: 0.60
+    obstacle_reaction_time: 0.20
+    obstacle_stop_margin: 0.12
+    # Speed limiting only sees live obstacles intersecting the accepted local
+    # B-spline within the next 0.5 m. Nearby off-route and farther obstacles
+    # remain available to SCAN for replanning but do not reduce chassis speed.
+    obstacle_braking_path_horizon: 0.50
+    # All distances below are live-scan clearance from the physical body edge.
+    # Temporarily disable only the hard emergency latch for controlled testing.
+    # Within 12 cm translation is still held while yaw remains available for
+    # local-path alignment; live avoidance, braking and watchdog stops remain.
+    obstacle_emergency_stop_enabled: false
+    obstacle_emergency_clearance: 0.05
+    obstacle_rotation_only_clearance: 0.12
+    # These hysteresis thresholds take effect again if the latch is re-enabled.
+    obstacle_emergency_speed_threshold: 0.15
+    obstacle_emergency_speed_release: 0.10
+    # Physical body rectangle used only by the controller's route sweep.
+    obstacle_body_half_length: 0.28
+    obstacle_body_half_width: 0.15
+    # Replanning uses the extra 3 cm to match the r=0.18 m inflated footprint.
+    # The 0.5 m speed limiter above deliberately uses no extra margin.
+    obstacle_corridor_margin: 0.03
+    obstacle_cloud_max_range: 4.0
+    obstacle_body_z_min: -0.39
+    obstacle_body_z_max: 0.55
+    # Match the pre-experiment near-body capsule. This removes the lidar/body
+    # core without hiding the full 0.75 m manoeuvring area.
+    obstacle_self_filter_radius: 0.24
+    obstacle_self_filter_offset: 0.12
+    obstacle_self_filter_z_min: -0.55
+    obstacle_self_filter_z_max: 0.30
+    base_to_lidar_x: 0.1701
+    base_to_lidar_y: 0.0
+    base_to_lidar_z: 0.0908
+    base_to_lidar_yaw: 1.57079632679
     # LIO-SAM mapping odometry is about 5 Hz and occasionally has a 0.45 s
     # inter-frame gap. Keep three-frame tolerance while the 0.30 s command
     # watchdog in the chassis gate still stops command loss first.
     odom_timeout: 0.75
-    # Independent last-line watchdog: even if the planner callback stalls,
-    # stale lidar immediately forces cmd_vel to zero.
-    cloud_timeout: 0.60
+    # Independent last-line watchdog runs on the current raw XT16 scan, not
+    # the deliberately delayed time-aligned planning cloud.
+    cloud_timeout: 0.35
     trajectory_timeout: 0.5
+
+go2_near_field_cloud_fuser:
+  ros__parameters:
+    use_sim_time: false
+    far_topic: /lio_sam/deskew/cloud_deskewed
+    raw_topic: /unitree/slam_lidar/points
+    output_topic: /scan_planner/local_cloud
+    # LIO-SAM keeps its 1 m minimum range for stable odometry. Add only the
+    # self-filtered near annulus to local collision avoidance.
+    near_min_range: 0.25
+    near_max_range: 1.05
+    near_voxel_size: 0.04
+    max_raw_age: 0.25
+    # Match the raw near scan to the same LIO-SAM acquisition by message
+    # timestamp. The latest received raw scan is normally 0.2 s too new.
+    max_raw_stamp_delta: 0.03
+    base_to_lidar_x: 0.1701
+    base_to_lidar_y: 0.0
+    base_to_lidar_z: 0.0908
+    base_to_lidar_yaw: 1.57079632679
+    # Pre-experiment near-body capsule radius.
+    self_filter_radius: 0.24
+    self_filter_offset: 0.12
+    self_filter_z_min: -0.55
+    self_filter_z_max: 0.30
+    # Reject the lowest ~8 cm above the nominal floor from both near and far
+    # clouds; these returns form the concentric ground scan rings.
+    obstacle_body_z_min: -0.39
+    obstacle_body_z_max: 0.55
 
 go2_realtime_recovery:
   ros__parameters:
     use_sim_time: false
-    double_cylinder_radius: 0.23
-    double_cylinder_offset: 0.12
+    double_cylinder_radius: 0.18
+    double_cylinder_offset: 0.13
     # Body centre is about 0.47 m above the floor. Ignore the floor itself but
     # retain obstacle returns from roughly 8 cm above it through body height.
     obstacle_min_below_body: 0.39
     obstacle_max_above_body: 0.50
     activation_clearance: 0.45
     activation_delay: 1.0
+    cloud_topic: /scan_planner/local_cloud
     cloud_timeout: 0.35
     pose_timeout: 0.40
     cooldown: 1.5
@@ -162,7 +269,10 @@ go2_realtime_recovery:
 
 go2_scan_lio_pose_adapter:
   ros__parameters:
-    source_topic: /lio_sam/mapping/odometry
+    # High-rate pose fused from IMU preintegration and periodic scan-to-map
+    # corrections. /lio_sam/mapping/odometry remains the low-rate correction
+    # source inside LIO-SAM and is not suitable for controller watchdogs.
+    source_topic: /odometry/imu
     frame_id: odom
     base_frame_id: base_link
     sensor_frame_id: rslidar
@@ -173,12 +283,12 @@ go2_scan_lio_pose_adapter:
     world_z_offset: 0.53
     velocity_alpha: 0.35
     max_velocity_sample: 2.0
+    output_rate_hz: 50.0
 
 go2_static_navigation_map:
   ros__parameters:
     map_yaml: /root/go2_navigation_maps/map_20260811_155640_273_nav.yaml
     inflated_map_yaml: /root/go2_navigation_maps/map_20260811_155640_273_nav_inflated.yaml
-    obstacle_pcd: /root/go2_navigation_maps/map_20260811_155640_273_nav_obstacles.pcd
     metadata_json: /root/go2_navigation_maps/map_20260811_155640_273_nav.json
     alignment_json: /root/go2_navigation_maps/map_20260811_155640_273_nav_alignment.json
     frame_id: odom

@@ -27,6 +27,7 @@ setup(
             'forward_test_goal = go2_scan_planner_bridge.forward_test_goal:main',
             'static_navigation_map = go2_scan_planner_bridge.static_navigation_map:main',
             'realtime_recovery = go2_scan_planner_bridge.realtime_recovery:main',
+            'near_field_cloud_fuser = go2_scan_planner_bridge.near_field_cloud_fuser:main',
         ],
     },
 )

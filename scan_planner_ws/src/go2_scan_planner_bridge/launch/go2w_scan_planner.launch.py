@@ -25,15 +25,15 @@ def _setup(context):
     common_remaps = [
         ('body_pose', '/scan_planner/body_pose'),
         ('sensor_pose', '/scan_planner/sensor_pose'),
-        ('cloud', '/lio_sam/deskew/cloud_deskewed'),
-        ('static_cloud', '/scan_planner/static_obstacles'),
-        ('static_navigation_grid', '/navigation/inflated_map'),
+        ('cloud', '/scan_planner/local_cloud'),
         ('move_base_simple/goal', '/scan_planner/goal'),
         ('initial_path', '/scan_planner/global_path'),
         ('planning/bspline', '/scan_planner/planning/bspline'),
         ('planning/go2_execution_frozen', '/scan_planner/planning/execution_frozen'),
         ('planning/replan_request', '/scan_planner/planning/replan_request'),
+        ('planning/controller_velocity_world', '/scan_planner/planning/controller_velocity_world'),
         ('planning/local_waiting', '/scan_planner/planning/local_waiting'),
+        ('planning/local_horizon', '/scan_planner/planning/local_horizon'),
         ('navigation_cancel', '/scan_planner/cancel'),
         ('navigation_completed', '/scan_planner/navigation_completed'),
         ('planning/data_display', '/scan_planner/planning/data_display'),
@@ -53,6 +53,9 @@ def _setup(context):
             package='go2_scan_planner_bridge', executable='lio_pose_adapter',
             name='go2_scan_lio_pose_adapter', output='screen', parameters=[config]),
         Node(
+            package='plan_env', executable='near_field_cloud_fuser',
+            name='go2_near_field_cloud_fuser', output='screen', parameters=[config]),
+        Node(
             package='scan_planner', executable='scan_planner_node',
             name='scan_planner_node', output='screen', parameters=[config],
             remappings=common_remaps),
@@ -61,11 +64,17 @@ def _setup(context):
             name='closed_loop_controller', output='screen', parameters=[config],
             remappings=[
                 ('body_pose', '/scan_planner/body_pose'),
-                ('cloud', '/lio_sam/deskew/cloud_deskewed'),
+                # Emergency braking must use the newest sensor-frame XT16
+                # scan. The time-aligned local_cloud intentionally waits for
+                # delayed LIO poses and belongs to trajectory planning only.
+                ('cloud', '/unitree/slam_lidar/points'),
+                ('initial_path', '/scan_planner/global_path'),
                 ('planning/bspline', '/scan_planner/planning/bspline'),
                 ('planning/local_path', '/scan_planner/local_path'),
                 ('planning/go2_execution_frozen', '/scan_planner/planning/execution_frozen'),
                 ('planning/replan_request', '/scan_planner/planning/replan_request'),
+                ('planning/controller_velocity_world', '/scan_planner/planning/controller_velocity_world'),
+                ('planning/emergency_stop', '/scan_planner/emergency_stop'),
                 ('navigation_cancel', '/scan_planner/cancel'),
                 ('cmd_vel', '/scan_planner/cmd_vel_test'),
             ]),

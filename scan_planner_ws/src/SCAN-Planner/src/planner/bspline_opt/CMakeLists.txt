@@ -15,6 +15,7 @@ find_package(rclcpp REQUIRED)
 add_library(bspline_opt
   src/uniform_bspline.cpp
   src/bspline_optimizer.cpp
+  src/curvature_bspline_optimizer.cpp
   src/gradient_descent_optimizer.cpp)
 target_include_directories(bspline_opt PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -33,6 +34,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_uniform_bspline test/test_uniform_bspline.cpp)
   if(TARGET test_uniform_bspline)
     target_link_libraries(test_uniform_bspline bspline_opt Eigen3::Eigen)
+  endif()
+  ament_add_gtest(test_curvature_bspline_optimizer
+    test/test_curvature_bspline_optimizer.cpp)
+  if(TARGET test_curvature_bspline_optimizer)
+    target_link_libraries(test_curvature_bspline_optimizer
+      bspline_opt Eigen3::Eigen)
   endif()
 endif()
 

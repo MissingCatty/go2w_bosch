@@ -21,7 +21,7 @@ saved map_*.npz
      -> Web A* global reference path
 
 /lio_sam/deskew/cloud_deskewed + poses
-  -> SCAN live 3D occupancy + immutable inflated 2D wall boundary
+  -> SCAN live 3D occupancy only
 
 SCAN local 3D occupancy grid
   -> collision-aware B-spline
@@ -42,18 +42,20 @@ startup origin with the floor measured in the saved map; it is configurable in
 
 The saved-map `map -> odom` transform is loaded by `go2_static_navigation_map`
 after the Web automatic registration validates it for the current boot and map.
-SCAN does not inject the saved 3D obstacle cloud into its clearable local
-occupancy memory.  The current lidar owns temporary-obstacle avoidance, while
-the separately published footprint-inflated 2D grid remains an immutable hard
-boundary for local A* and final trajectory checks.  This lets a local path move
-up to `0.75m` away from the global centreline to pass a chair without reopening
-the earlier wall-crossing failure mode.
+The static map has one navigation role: Web A* uses it to produce the global
+reference path. SCAN and the recovery node do not subscribe to the saved 3D
+cloud or static occupancy grids. Their occupancy, collision checks, detours and
+recovery primitives are validated only against current lidar data. There is no
+hard corridor around the global centreline; only a weak route-shape preference
+remains so the local planner can take a wide live detour.
 
-The controller does not advance its reference clock blindly.  A large heading
+The controller does not advance its reference clock blindly. A large heading
 error first enters turn-only mode with hysteresis, while moderate error is
-corrected during translation.  If the desired point gets more than `0.25m`
-ahead, trajectory time pauses until the robot catches up.  A lag lasting over
-`2.5s` asks the FSM to replan from current odometry; reaching the nominal
+corrected during translation. If tracking error exceeds `0.25m`, or the robot
+passes a reference point by more than `0.20m`, that local trajectory is
+discarded immediately: output becomes zero and the FSM replans from measured
+odometry. Small along-track overshoot is never chased backwards, and normal
+path tracking clamps body-frame reverse speed to zero. Reaching the nominal
 trajectory duration away from the real target also replans instead of falsely
 reporting completion.
 

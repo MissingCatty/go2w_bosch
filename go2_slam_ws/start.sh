@@ -78,8 +78,13 @@ fi
 
 echo "==> [2/5] 构建 host 工作空间"
 if [ ! -d "$WS/install/go2_slam_core" ] || \
-   [ ! -d "$WS/install/go2_imu_bridge" ] || $BUILD; then
-    (cd "$WS" && colcon build --symlink-install)
+   [ ! -d "$WS/install/go2_imu_bridge" ] || \
+   [ ! -d "$WS/install/go2_remembr" ] || \
+   [ ! -d "$WS/install/go2_slam_web" ] || $BUILD; then
+    # The Nav2 Humble overlay lives outside src/ because this host workspace is
+    # ROS 2 Foxy. Restrict host discovery so a normal rebuild never tries to
+    # resolve Humble-only nav2_msgs dependencies.
+    (cd "$WS" && colcon build --base-paths "$WS/src" --symlink-install)
 else
     echo "    已构建（强制重编: ./start.sh --build）"
 fi
@@ -113,7 +118,8 @@ if ! wait_topic_data /unitree/slam_lidar/points 20; then
     exit 1
 fi
 
-if ! systemctl --user is-active --quiet go2-slam-host.service || \
+if $BUILD || \
+   ! systemctl --user is-active --quiet go2-slam-host.service || \
    ! topic_has_data /dog_imu_lio || \
    ! curl -fsS --max-time 1 http://127.0.0.1:8890/api/status >/dev/null; then
     stop_user_unit go2-slam-host.service
@@ -173,3 +179,8 @@ curl -fsS --max-time 3 http://127.0.0.1:8890/api/status || \
 echo
 echo "  日志: $XT16_LOG  $HOST_LOG  $LIO_LOG"
 echo "============================================================"
+
+# ros2 CLI discovery starts a background daemon during the readiness probes.
+# Runtime nodes communicate directly through DDS and do not need it; leaving
+# the daemon alive on this dense graph costs roughly one third of a CPU core.
+ros2 daemon stop >/dev/null 2>&1 || true

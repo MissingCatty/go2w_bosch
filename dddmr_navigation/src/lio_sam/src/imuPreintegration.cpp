@@ -108,6 +108,11 @@ public:
             else
                 break;
         }
+        // A mapping correction can catch up with every queued IMU odometry
+        // sample during startup.  Wait for the next sample instead of
+        // dereferencing an empty deque (which previously crashed this node).
+        if (imuOdomQueue.empty())
+            return;
         Eigen::Isometry3d imuOdomAffineFront = odom2affine(imuOdomQueue.front());
         Eigen::Isometry3d imuOdomAffineBack = odom2affine(imuOdomQueue.back());
         Eigen::Isometry3d imuOdomAffineIncre = imuOdomAffineFront.inverse() * imuOdomAffineBack;
