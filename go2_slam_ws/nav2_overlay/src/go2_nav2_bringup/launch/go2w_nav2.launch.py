@@ -91,6 +91,11 @@ def generate_launch_description():
             name='go2_nav2_map_odom_bridge', output='screen',
             arguments=['--ros-args', '--log-level', log_level]),
         Node(
+            package='go2_nav2_bringup', executable='odom_qos_bridge',
+            name='go2_nav2_odom_qos_bridge', output='screen',
+            parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level]),
+        Node(
             package='go2_nav2_bringup', executable='nav_goal_bridge',
             name='go2_nav2_goal_bridge', output='screen',
             arguments=['--ros-args', '--log-level', log_level]),

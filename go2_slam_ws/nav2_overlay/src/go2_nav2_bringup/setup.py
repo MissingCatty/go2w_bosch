@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'map_odom_bridge = go2_nav2_bringup.map_odom_bridge:main',
             'nav_goal_bridge = go2_nav2_bringup.nav_goal_bridge:main',
+            'odom_qos_bridge = go2_nav2_bringup.odom_qos_bridge:main',
             'shadow_monitor = go2_nav2_bringup.shadow_monitor:main',
         ],
     },

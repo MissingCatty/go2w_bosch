@@ -5,6 +5,13 @@ map_server:
     topic_name: map
     yaml_filename: /root/go2_slam_ws/maps/navigation/map_20260811_155640_273_nav.yaml
 
+go2_nav2_odom_qos_bridge:
+  ros__parameters:
+    use_sim_time: false
+    input_topic: /scan_planner/body_pose
+    output_topic: /go2/nav2/odom
+    stale_timeout: 0.5
+
 planner_server:
   ros__parameters:
     use_sim_time: false
@@ -42,7 +49,7 @@ controller_server:
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.5
-    odom_topic: /scan_planner/body_pose
+    odom_topic: /go2/nav2/odom
     progress_checker_plugin: progress_checker
     goal_checker_plugins: [general_goal_checker]
     controller_plugins: [FollowPath]
@@ -268,7 +275,7 @@ bt_navigator:
     use_sim_time: false
     global_frame: nav_map
     robot_base_frame: base_link
-    odom_topic: /scan_planner/body_pose
+    odom_topic: /go2/nav2/odom
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -340,7 +347,7 @@ velocity_smoother:
     min_velocity: [-0.20, 0.0, -0.45]
     max_accel: [0.60, 0.0, 0.60]
     max_decel: [-1.50, 0.0, -1.20]
-    odom_topic: /scan_planner/body_pose
+    odom_topic: /go2/nav2/odom
     odom_duration: 0.10
     deadband_velocity: [0.015, 0.0, 0.015]
     velocity_timeout: 0.30
@@ -353,7 +360,9 @@ collision_monitor:
     cmd_vel_in_topic: /go2/nav2/cmd_vel_smoothed
     cmd_vel_out_topic: /go2/nav2/cmd_vel_safe
     transform_tolerance: 0.20
-    source_timeout: 0.35
+    # The fused cloud is self/ground filtered and follows the 5-10 Hz LIO
+    # cadence, which can occasionally leave a 0.45 s inter-frame gap.
+    source_timeout: 0.75
     base_shift_correction: true
     stop_pub_timeout: 0.50
     polygons: [PolygonStop, PolygonSlow, FootprintApproach]
@@ -386,7 +395,10 @@ collision_monitor:
     observation_sources: [pointcloud]
     pointcloud:
       type: pointcloud
-      topic: /unitree/slam_lidar/points
+      # Raw XT16 scans contain persistent returns from the GO2-W body inside
+      # PolygonStop. Reuse SCAN's near-field self/ground-filtered cloud so the
+      # collision layer does not interpret the robot itself as an obstacle.
+      topic: /scan_planner/local_cloud
       min_height: -0.20
       max_height: 0.80
       enabled: true
